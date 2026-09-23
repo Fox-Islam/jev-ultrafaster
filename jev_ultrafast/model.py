@@ -263,6 +263,23 @@ def field_context(goal, action, page, history):
     }
 
 
+def field_value(content):
+    """The JSON object a text helper meant to send, out of what it actually sent.
+
+    Asking for a JSON object does not guarantee one arrives alone: a model may fence it, introduce
+    it, or follow it with a remark. Recovering the object costs nothing and does not widen what
+    counts as a valid answer - the value inside it is still checked as strictly as before.
+    """
+    text = (content or "").strip()
+    if text.startswith("```"):
+        text = text.strip("`")
+        text = text.split("\n", 1)[1] if "\n" in text else text
+    start, end = text.find("{"), text.rfind("}")
+    if start != -1 and end > start:
+        text = text[start : end + 1]
+    return json.loads(text)
+
+
 def field_text(context):
     key = os.environ.get("TEXT_MODEL_API_KEY")
     if not key:
@@ -278,7 +295,7 @@ def field_text(context):
         key,
         {
             "model": model,
-            "max_tokens": 1024,
+            "max_tokens": 4096,
             "response_format": {"type": "json_object"},
             **reasoning,
             "messages": [
@@ -290,13 +307,17 @@ def field_text(context):
             ],
         },
     )
+    content = (result.get("choices") or [{}])[0].get("message", {}).get("content")
     try:
-        output = json.loads(result["choices"][0]["message"]["content"])
+        output = field_value(content)
         value = output["text"]
         if set(output) != {"text"} or not isinstance(value, str) or not value.strip() or len(value) > 2000:
             raise ValueError()
     except (ValueError, KeyError, TypeError):
-        raise ValueError("Text helper returned no valid field value; nothing typed.") from None
+        # Carry what came back: without it the next occurrence is as undiagnosable as the last.
+        raise ValueError(
+            f"Text helper returned no valid field value; nothing typed. Got: {str(content)[:120]!r}"
+        ) from None
     return value, {
         "model": model,
         "latency_ms": round((time.perf_counter() - started) * 1000),

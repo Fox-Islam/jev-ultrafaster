@@ -445,3 +445,25 @@ def test_a_persistently_unusable_field_value_stops_the_run(runner, monkeypatch):
     runner.text_failures = 99
     with pytest.raises(ValueError, match="no valid field value"):
         runner.command("act", {"fingerprint": runner.state["page"]["fingerprint"]})
+
+
+@pytest.mark.parametrize(
+    "content,expected",
+    [
+        ('{"text":"Zurich"}', "Zurich"),
+        ('```json\n{"text":"Zurich"}\n```', "fenced"),
+        ('Here you go: {"text":"Zurich"}', "prose before"),
+        ('{"text":"Zurich"}\nHope that helps.', "prose after"),
+    ],
+)
+def test_a_wrapped_json_object_is_still_read(monkeypatch, content, expected):
+    monkeypatch.setenv("TEXT_MODEL_API_KEY", "test")
+    monkeypatch.setattr(model, "post_json", Mock(return_value={"choices": [{"message": {"content": content}}]}))
+    assert model.field_text({"goal": "x"})[0] == "Zurich", expected
+
+
+def test_the_rejected_content_is_named_in_the_error(monkeypatch):
+    monkeypatch.setenv("TEXT_MODEL_API_KEY", "test")
+    monkeypatch.setattr(model, "post_json", Mock(return_value={"choices": [{"message": {"content": "I cannot"}}]}))
+    with pytest.raises(ValueError, match="I cannot"):
+        model.field_text({"goal": "x"})
