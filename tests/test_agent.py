@@ -327,18 +327,24 @@ def test_navigation_during_prediction_reobserves_without_action(runner):
     runner.state["browser"].act.assert_not_called()
 
 
-def test_plan_asks_one_check_per_outstanding_goal():
-    questions = model.plan_questions(["Set the origin", "Run the search"])
-    assert set(questions) == {"plan0_satisfied", "plan1_satisfied"}
-    assert all(q["type"] == "noul" for q in questions.values())
+def test_plan_asks_a_check_and_a_decision_per_outstanding_goal():
+    _, targets, _ = model.action_space(page()["actions"])
+    operations = {"CLICK": "click", "TYPE_TEXT": "type", "DONE": "done", "BLOCKED": "blocked"}
+    questions = model.plan_questions(["Set the origin", "Run the search"], operations, targets, {})
+    assert {"plan0_satisfied", "plan1_satisfied"} <= set(questions)
+    assert questions["plan0_satisfied"]["type"] == "noul"
     assert "Set the origin" in questions["plan0_satisfied"]["instructions"]
+    # Each outstanding goal also gets a decision, so its answer can replace a later call.
+    assert {"plan0_operation", "plan0_click_target", "plan1_operation"} <= set(questions)
 
 
 @pytest.mark.parametrize(
     "answer,expected", [({"noul": 0.95}, 0.95), ({"noul": None}, None), ({}, None), ({"noul": 2}, None)]
 )
 def test_unreadable_satisfaction_is_dropped_not_raised(answer, expected):
-    assert model.read_plan_answers({"plan0_satisfied": answer}, ["a"]) == [expected]
+    read = model.read_plan_answers({"plan0_satisfied": answer}, ["a"], {}, {}, {})
+    assert read[0]["satisfied"] == expected
+    assert read[0]["label"] is None  # no readable decision either, and that must not raise
 
 
 def test_a_fully_satisfied_plan_ends_the_run_without_acting(runner):

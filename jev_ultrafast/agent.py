@@ -10,7 +10,7 @@ from .questions import FIXATION_REPEATS, FIXATION_WINDOW, MAX_STEPS, PLAN_SATISF
 
 
 class Agent:
-    def __init__(self, url, goals, *, record_dir=None, screenshots=False, track_plan=False):
+    def __init__(self, url, goals, *, record_dir=None, screenshots=False, track_plan=False, reuse_held=True):
         steps = [goals] if isinstance(goals, str) else list(goals)
         steps = [step.strip() for step in steps if step and step.strip()]
         task = "\n".join(steps)
@@ -21,6 +21,10 @@ class Agent:
         plan = steps if self.track_plan else [task]
         # A sub-goal can be satisfied by an action aimed at another, so this is a set, not an index.
         self.plan_satisfied = set()
+        # Decisions taken for later sub-goals, kept until they apply or are overwritten.
+        self.held = {}
+        self.reuse_held_answers = reuse_held
+        self.reused = 0
         self.pending_text = None
         self.browser = Browser(url)
         self.record_dir = Path(record_dir) if record_dir else None
@@ -85,6 +89,14 @@ class Agent:
                 if getattr(self, "track_plan", False)
                 else []
             )
+            # A held answer that still applies replaces this turn's call. Checking costs one local
+            # lookup over the current snapshot; being wrong costs the call that would have happened.
+            reused = self.reuse_held(outstanding) if self.reuse_held_answers else None
+            if reused:
+                state["decision"] = reused
+                self.reused += 1
+                state["status"] = "predicted"
+                return self.snapshot()
             state["decision"] = choose(
                 state["page"],
                 state["goal"],
@@ -94,10 +106,16 @@ class Agent:
             )
             # These readings describe the page this call saw, so a sub-goal retires in the same call
             # that measured it. Retiring is one-way: the question is not asked again.
-            for index, satisfied in zip(outstanding, state["decision"].get("plan") or []):
+            for index, entry in zip(outstanding, state["decision"].get("plan") or []):
+                satisfied = entry["satisfied"]
                 if satisfied is not None and satisfied >= PLAN_SATISFIED:
                     self.plan_satisfied.add(index)
             state["plan_satisfied"] = sorted(self.plan_satisfied)
+            self.held = {
+                index: entry
+                for index, entry in zip(outstanding, state["decision"].get("plan") or [])
+                if entry.get("label") and index not in self.plan_satisfied
+            }
             state["decisions"].append(
                 {
                     **state["decision"],
@@ -203,6 +221,58 @@ class Agent:
                 key = (step["action"], step["kind"])
                 seen[key] = seen.get(key, 0) + 1
         return {key for key, count in seen.items() if count >= FIXATION_REPEATS}
+
+    def reuse_held(self, outstanding):
+        """A decision held for a sub-goal, re-resolved against the page as it is now.
+
+        The answer is reused, not the element it named: a node id survives a change of meaning, so
+        the label and kind are looked up again and must match exactly one control. Because the
+        action comes from the current snapshot, the ordinary freshness gate still applies to it.
+        """
+        state = self.state
+        for index in outstanding:
+            entry = self.held.get(index)
+            if not entry or entry["operation"] in {"DONE", "BLOCKED", "WAIT"}:
+                continue
+            matches = [
+                action
+                for action in state["page"]["actions"]
+                if action["label"] == entry["label"] and action["kind"] == entry["kind"]
+            ]
+            if len(matches) != 1:
+                continue
+            action = matches[0]
+            # Sub-goals asked against one page converge on whatever control that page makes
+            # obvious, so a held answer is usually the action just taken. Repeating it is not
+            # progress, and on the flights task it produced three clicks on the same suggestion.
+            if any(
+                past["action"] == action["label"] and past["kind"] == action["kind"]
+                for past in state["history"][-2:]
+            ):
+                continue
+            if action["kind"] == "fill" and action.get("value"):
+                continue  # already carries a value; re-typing it is not progress
+            # One reuse per call: satisfaction readings are only refreshed when Jev is asked, so
+            # after acting on a held answer nothing knows which sub-goals are still outstanding.
+            self.held = {}
+            return {
+                "choice": action["id"],
+                "operation": entry["operation"],
+                "target": None,
+                "confidence": entry["confidence"],
+                "probabilities": {action["id"]: entry["confidence"] or 0.0},
+                "operation_probabilities": {},
+                "target_probabilities": {},
+                "target_confidence": None,
+                "raw_answers": {},
+                "plan": [],
+                "model": "held",
+                "usage": {},
+                "latency_ms": 0,
+                "reused_for": index,
+                "request": None,
+            }
+        return None
 
     def run(self):
         while self.state["status"] not in {"done", "blocked"}:
