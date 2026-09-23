@@ -12,6 +12,35 @@ from .questions import NEXT_ACTION, TARGET, TEXT_VALUE
 CLIENT = httpx.Client(http2=True, timeout=25)
 
 
+def system_one_url():
+    """Where decisions are sent. Any server implementing /v1/systemone answers this request, so
+    pointing it at a local one is a base URL, not a fork."""
+    return os.environ.get("TYPESAFE_BASE_URL", "https://api.typesafe.ai").rstrip("/") + "/v1/systemone"
+
+
+def describe_target(index, action):
+    """One option description, as text. The spec takes a description as a string, and a server that
+    holds to it rejects anything else, so the role and current value go in the sentence."""
+    parts = [f"Element [{index}], labelled {action['label']!r}"]
+    if action.get("role"):
+        parts.append(f"a {action['role']}")
+    value = action.get("current_value", action.get("value", ""))
+    if value:
+        parts.append(f"currently holding {value!r}")
+    for flag in ("checked", "selected", "expanded"):
+        if flag in action:
+            parts.append(f"{flag}: {action[flag]}")
+    return ", ".join(parts) + "."
+
+
+def flatten_instructions(goal, rules, operation=None):
+    """Instructions as one string, for the same reason."""
+    head = [f"Goal: {goal}"]
+    if operation:
+        head.append(f"Operation under consideration: {operation}")
+    return "\n\n".join(head + ([rules] if isinstance(rules, str) else list(rules)))
+
+
 def post_json(url, key, body):
     for attempt in range(3):
         try:
@@ -78,7 +107,37 @@ def action_space(actions):
     return elements, targets, controls
 
 
-def choose(state, goal, history):
+def plan_questions(pending):
+    """One satisfaction check per outstanding sub-goal.
+
+    These ride in the request that was being sent anyway. A whole-task DONE is one broad judgement
+    and answers weakly when the page could arguably be said to satisfy the goal already; a sub-goal
+    asks something narrow enough to answer sharply.
+    """
+    return {
+        f"plan{offset}_satisfied": {
+            "type": "noul",
+            "instructions": f"Is this step already satisfied on the page as it stands?\n\nStep: {text}",
+            "criteria": {
+                "true": "The page already shows this step's outcome.",
+                "false": "This step still needs an action, or the page does not show its outcome.",
+            },
+        }
+        for offset, text in enumerate(pending)
+    }
+
+
+def read_plan_answers(answers, pending):
+    """Probability that each outstanding sub-goal is already satisfied, or None if unreadable.
+    A malformed reading must not stop the run, so it is dropped rather than raised."""
+    read = []
+    for offset in range(len(pending)):
+        value = answers.get(f"plan{offset}_satisfied", {}).get("noul")
+        read.append(value if isinstance(value, (int, float)) and 0 <= value <= 1 else None)
+    return read
+
+
+def choose(state, goal, history, pending=()):
     elements, targets, controls = action_space(state["actions"])
     labels = {
         "CLICK": "Click an element, button, menu option, autocomplete suggestion, or calendar day.",
@@ -89,21 +148,20 @@ def choose(state, goal, history):
     operations.update({key: value["label"] for key, value in controls.items()})
     operations.update(DONE="Every requirement is visibly satisfied.", BLOCKED="No supported operation can progress.")
     questions = {
-        "operation": {"type": "choice", "criteria": operations, "instructions": {"goal": goal, "rules": NEXT_ACTION}}
+        "operation": {"type": "choice", "criteria": operations, "instructions": flatten_instructions(goal, NEXT_ACTION)}
     }
+    # A head offering one candidate is not a choice: it answers 1.00 whatever the element is, which
+    # reads as certainty to anything downstream weighing confidence.
+    settled = {operation: next(iter(candidates)) for operation, candidates in targets.items() if len(candidates) == 1}
     for operation, candidates in targets.items():
+        if operation in settled:
+            continue
         questions[operation.lower() + "_target"] = {
             "type": "choice",
-            "criteria": {
-                index: {
-                    "element": f"[{index}] {a['label']}",
-                    "current_value": a.get("current_value", a.get("value", "")),
-                    **{k: a[k] for k in ("role", "checked", "selected", "expanded") if k in a},
-                }
-                for index, a in candidates.items()
-            },
-            "instructions": {"goal": goal, "operation": operation, "rules": [NEXT_ACTION, TARGET]},
+            "criteria": {index: describe_target(index, a) for index, a in candidates.items()},
+            "instructions": flatten_instructions(goal, [NEXT_ACTION, TARGET], operation),
         }
+    questions.update(plan_questions(pending))
     body = {
         "model": os.environ.get("TYPESAFE_MODEL", "jev-latest"),
         "state": {
@@ -116,13 +174,17 @@ def choose(state, goal, history):
         "questions": questions,
     }
     started = time.perf_counter()
-    result = post_json("https://api.typesafe.ai/v1/systemone", os.environ["TYPESAFE_API_KEY"], body)
+    result = post_json(system_one_url(), os.environ["TYPESAFE_API_KEY"], body)
     operation_answer = validate_choice(result["answers"].get("operation", {}), operations)
     operation = operation_answer["choice"]
     target = None
     target_answer = None
     probabilities = {}
-    if operation in targets:
+    if operation in settled:
+        target = settled[operation]
+        choice = targets[operation][target]["id"]
+        probabilities = {choice: operation_answer["probabilities"][operation]}
+    elif operation in targets:
         # Unused target heads cannot cause an action. Validate the head selected by the operation.
         target_answer = validate_choice(result["answers"].get(operation.lower() + "_target", {}), targets[operation])
         target = target_answer["choice"]
@@ -140,6 +202,7 @@ def choose(state, goal, history):
         "operation_probabilities": operation_answer["probabilities"],
         "target_probabilities": target_answer["probabilities"] if target_answer else {},
         "target_confidence": target_answer["confidence"] if target_answer else None,
+        "plan": read_plan_answers(result["answers"], pending),
         "raw_answers": result["answers"],
         "model": result["model"],
         "usage": result.get("usage", {}),

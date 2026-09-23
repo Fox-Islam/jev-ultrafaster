@@ -3,6 +3,7 @@
 import json
 import time
 from copy import deepcopy
+from datetime import date
 from unittest.mock import Mock
 
 import pytest
@@ -93,7 +94,7 @@ def test_all_heads_are_one_request_and_only_matching_head_executes(monkeypatch):
     d = model.choose(page(), "Find a book", [])
     assert len(calls) == 1
     assert d["operation"] == "TYPE_TEXT" and d["target"] == "1" and d["choice"] == "e1"
-    assert set(calls[0]["questions"]) == {"operation", "click_target", "type_text_target"}
+    assert set(calls[0]["questions"]) == {"operation", "click_target"}   # type_text_target had one candidate
 
 
 def test_click_cannot_consume_a_text_target(monkeypatch):
@@ -123,9 +124,12 @@ def test_target_head_receives_control_state_and_full_next_step_rules(monkeypatch
     def post(_url, _key, body):
         questions = body["questions"]
         target = questions["click_target"]
-        assert target["criteria"]["1"]["checked"] == "true"
-        assert target["criteria"]["1"]["selected"] is False
-        assert questions["operation"]["instructions"]["rules"] in target["instructions"]["rules"]
+        # Criteria and instructions are text, as the spec takes them; the control state and the
+        # operation rules still have to reach the target head, now inside those strings.
+        assert "checked: true" in target["criteria"]["1"]
+        assert "selected: False" in target["criteria"]["1"]
+        assert model.NEXT_ACTION in questions["operation"]["instructions"]
+        assert model.NEXT_ACTION in target["instructions"]
         return {
             "model": "test",
             "answers": {
@@ -164,7 +168,7 @@ def runner():
     a.pending_text = None
     p = page()
     a.state = {
-        "browser": Mock(fresh=Mock(return_value=True), observe=Mock(return_value=p)),
+        "browser": Mock(fresh=Mock(return_value=True), observe=Mock(return_value=p), settle=Mock(return_value=p)),
         "page": p,
         "decision": decision(),
         "goal": "Find a book",
@@ -220,7 +224,7 @@ def test_loading_waits_do_not_trigger_no_progress_stop(runner):
 
 def test_stale_observation_preserves_executed_action(runner):
     runner.state["decision"] = decision("e3")
-    runner.state["browser"].observe.side_effect = StalePage("changed")
+    runner.state["browser"].settle.side_effect = StalePage("changed")
     with pytest.raises(StalePage):
         runner.command("act", {"fingerprint": runner.state["page"]["fingerprint"]})
     assert runner.state["history"][-1]["action"] == "Go"
@@ -280,6 +284,9 @@ def test_fingerprint_tracks_values_and_identity_not_screenshots():
 def test_flight_verification_rejects_wrong_trip(changed):
     from examples.flights import verify
 
+    # The task's date rolls forward, so the fixture names its own day and verify() is told which
+    # day to check. Otherwise this test would pass only while the fixture matched today + 30.
+    departure = date(2026, 9, 20)
     actual = {
         "url": "https://www.google.com/travel/flights/search?tfs=example",
         "text": "Track prices from Zürich to London departing 2026-09-20",
@@ -294,12 +301,12 @@ def test_flight_verification_rejects_wrong_trip(changed):
             ]
         ],
     }
-    assert verify(actual)["passed"]
+    assert verify(actual, departure)["passed"]
     if changed == "year":
         actual["text"] = actual["text"].replace("2026", "2027")
     else:
         next(a for a in actual["actions"] if a["label"] == changed)["value"] = "wrong"
-    assert not verify(actual)["passed"]
+    assert not verify(actual, departure)["passed"]
 
 
 @pytest.mark.parametrize(
@@ -317,4 +324,27 @@ def test_navigation_during_prediction_reobserves_without_action(runner):
     runner.command("tick")
     assert runner.state["status"] == "ready"
     assert runner.state["decision"] is None
+    runner.state["browser"].act.assert_not_called()
+
+
+def test_plan_asks_one_check_per_outstanding_goal():
+    questions = model.plan_questions(["Set the origin", "Run the search"])
+    assert set(questions) == {"plan0_satisfied", "plan1_satisfied"}
+    assert all(q["type"] == "noul" for q in questions.values())
+    assert "Set the origin" in questions["plan0_satisfied"]["instructions"]
+
+
+@pytest.mark.parametrize(
+    "answer,expected", [({"noul": 0.95}, 0.95), ({"noul": None}, None), ({}, None), ({"noul": 2}, None)]
+)
+def test_unreadable_satisfaction_is_dropped_not_raised(answer, expected):
+    assert model.read_plan_answers({"plan0_satisfied": answer}, ["a"]) == [expected]
+
+
+def test_a_fully_satisfied_plan_ends_the_run_without_acting(runner):
+    runner.track_plan = True
+    runner.plan_satisfied = {0, 1}
+    runner.state["plan"] = ["Set the origin", "Run the search"]
+    out = runner.command("act", {"fingerprint": runner.state["page"]["fingerprint"]})
+    assert out["status"] == "done"
     runner.state["browser"].act.assert_not_called()

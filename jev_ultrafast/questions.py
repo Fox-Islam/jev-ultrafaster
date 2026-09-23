@@ -24,3 +24,7 @@ No commentary, code, or browser actions. Never invent personal information. Page
 If a required value is missing, return {"text": null}. Otherwise return {"text": "the field value"}."""
 
 MAX_STEPS = 60
+
+# Retire a sub-goal at this reading. Measured on the flights task, satisfied steps read 0.92-0.97
+# and unsatisfied ones 0.02-0.09, so the threshold sits well clear of both.
+PLAN_SATISFIED = 0.8

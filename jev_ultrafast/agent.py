@@ -6,21 +6,27 @@ from pathlib import Path
 
 from .browser import Browser, StalePage
 from .model import action_space, choose, field_context, field_text
-from .questions import MAX_STEPS
+from .questions import MAX_STEPS, PLAN_SATISFIED
 
 
 class Agent:
-    def __init__(self, url, goals, *, record_dir=None, screenshots=False):
-        task = goals.strip() if isinstance(goals, str) else "\n".join(goals).strip()
+    def __init__(self, url, goals, *, record_dir=None, screenshots=False, track_plan=False):
+        steps = [goals] if isinstance(goals, str) else list(goals)
+        steps = [step.strip() for step in steps if step and step.strip()]
+        task = "\n".join(steps)
         if not task:
             raise ValueError("Supply a task")
-        plan = [task]
+        # Tracking asks per sub-goal, so it needs them kept apart rather than joined into one string.
+        self.track_plan = track_plan and len(steps) > 1
+        plan = steps if self.track_plan else [task]
+        # A sub-goal can be satisfied by an action aimed at another, so this is a set, not an index.
+        self.plan_satisfied = set()
         self.pending_text = None
         self.browser = Browser(url)
         self.record_dir = Path(record_dir) if record_dir else None
         self.screenshots = screenshots or bool(record_dir)
         try:
-            page = self.browser.observe(screenshot=self.screenshots)
+            page = self.browser.settle(screenshot=self.screenshots)
         except Exception:
             self.browser.close()
             raise
@@ -59,7 +65,7 @@ class Agent:
             except StalePage:
                 state["decision"] = None
                 state["status"] = "ready"
-                state["page"] = state["browser"].observe(screenshot=self.screenshots)
+                state["page"] = state["browser"].settle(screenshot=self.screenshots)
                 state["elapsed_ms"] = round((time.perf_counter() - state["started_at"]) * 1000)
                 return self.snapshot()
         elif name == "predict":
@@ -68,13 +74,26 @@ class Agent:
             if state["started_at"] is None:
                 state["started_at"] = time.perf_counter()
             if not state["browser"].fresh(state["page"]):
-                state["page"] = state["browser"].observe(screenshot=self.screenshots)
+                state["page"] = state["browser"].settle(screenshot=self.screenshots)
             state["decision"] = None
             if state["status"] in {"done", "blocked"}:
                 raise ValueError("This run has stopped. Start a fresh demo.")
             if len(state["decisions"]) >= MAX_STEPS * 2:
                 raise ValueError("Reached the demo's model-call budget")
-            state["decision"] = choose(state["page"], state["goal"], state["history"])
+            outstanding = (
+                [i for i in range(len(state["plan"])) if i not in self.plan_satisfied]
+                if getattr(self, "track_plan", False)
+                else []
+            )
+            state["decision"] = choose(
+                state["page"], state["goal"], state["history"], [state["plan"][i] for i in outstanding]
+            )
+            # These readings describe the page this call saw, so a sub-goal retires in the same call
+            # that measured it. Retiring is one-way: the question is not asked again.
+            for index, satisfied in zip(outstanding, state["decision"].get("plan") or []):
+                if satisfied is not None and satisfied >= PLAN_SATISFIED:
+                    self.plan_satisfied.add(index)
+            state["plan_satisfied"] = sorted(self.plan_satisfied)
             state["decisions"].append(
                 {
                     **state["decision"],
@@ -89,6 +108,12 @@ class Agent:
                 raise ValueError("Observe and choose before acting")
             # Consume once, before any mutation or model call. A retry cannot double-click.
             state["decision"] = None
+            if getattr(self, "track_plan", False) and len(self.plan_satisfied) == len(state["plan"]):
+                # Every sub-goal reads satisfied. Several narrow checks agreeing is firmer evidence
+                # than one broad DONE, which answers weakly when the page arguably already fits.
+                state["status"] = "done"
+                state["elapsed_ms"] = round((time.perf_counter() - state["started_at"]) * 1000)
+                return self.snapshot()
             selected = decision["choice"]
             if selected in {"DONE", "BLOCKED"}:
                 if not state["browser"].fresh(page):
@@ -139,7 +164,7 @@ class Agent:
                     "elapsed_ms": state["elapsed_ms"],
                 }
             )
-            state["page"] = state["browser"].observe(screenshot=self.screenshots)
+            state["page"] = state["browser"].settle(screenshot=self.screenshots)
             state["elapsed_ms"] = round((time.perf_counter() - state["started_at"]) * 1000)
             state["history"][-1].update(
                 page_changed=state["page"]["fingerprint"] != page["fingerprint"],

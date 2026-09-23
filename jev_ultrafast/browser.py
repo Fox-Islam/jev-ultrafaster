@@ -97,6 +97,27 @@ class Browser:
             return current == [page["page_key"], page["guards"].get(str(node))]
         return self.evaluate(MARKER) == page["marker"]
 
+    def settle(self, screenshot=False, timeout=6.0):
+        """Observe until the page stops moving, so a decision is taken on a page that will still
+        be current when it is acted on.
+
+        A single-page app keeps hydrating after its route change. The first observation can carry
+        no actions at all, and one taken mid-hydration is stale before the answer returns. Each
+        costs a model call: an empty action space can only be answered BLOCKED, and a stale
+        terminal answer is discarded and re-asked."""
+        deadline = time.monotonic() + timeout
+        page = self.observe(screenshot=screenshot)
+        held = 0
+        while time.monotonic() < deadline:
+            time.sleep(0.3)
+            following = self.observe(screenshot=screenshot)
+            # Hydration has quiet moments, so one repeated fingerprint is not stability.
+            held = held + 1 if following["fingerprint"] == page["fingerprint"] else 0
+            page = following
+            if held >= 3 and operable(page):
+                return page
+        return page
+
     def act(self, action, page, text=None):
         if not self.fresh(page, action):
             raise StalePage("Page changed since this decision. Observe again.")
@@ -110,6 +131,12 @@ class Browser:
         if self.target:
             cdp("Target.closeTarget", targetId=self.target)
             self.target = None
+
+
+def operable(page):
+    """Whether anything on the page can be acted on. An unhydrated page still carries the WAIT
+    control, so the presence of actions says nothing on its own."""
+    return any(action.get("kind") in {"click", "fill", "select"} for action in page["actions"])
 
 
 def fingerprint(state):
