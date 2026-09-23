@@ -19,6 +19,8 @@ The optimized runtime was faster in all three pairs. Median task time was **25.0
 
 The original arm is the frozen source from `68c077bf79caca4e817b8e8a5854b2efa0c81ff6`. Both arms use Mercury so the runtime comparison does not conflate a helper-model change with code changes. Per-run source hashes, model settings, token counts, helper costs, browser version, protocol counts, and verification results are in the measurement JSON.
 
+These runs searched for 20 September 2026, and the figures above are the record of that day. The task now departs 30 days from whenever it runs, because a fixed date expires: from 21 September 2026 on no runtime could pass it, since the site sells no seats on a past day and the checker looks for them. `JEV_FLIGHTS_DATE` pins a specific day, and each run records its own `departure_date` — the task hash moves with the date and no longer identifies the task by itself.
+
 ## Where the time went
 
 The original loop invalidated decisions on every DOM mutation, including animations. It also read the accessibility tree repeatedly and resolved hundreds of DOM nodes. The new snapshot reads common HTML/ARIA controls in one browser call. Click guards compare the selected target and nearby context, plus document/form state. Current geometry and hit-testing still run before input.

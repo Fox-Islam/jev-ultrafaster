@@ -19,7 +19,7 @@ from jev_ultrafast import Agent  # noqa: E402
 from jev_ultrafast import browser as browser_module  # noqa: E402
 
 sys.path.append(str(Path(__file__).resolve().parents[1]))
-from examples.flights import GOALS, URL, verify  # noqa: E402
+from examples.flights import DEPARTURE, GOALS, URL, verify  # noqa: E402
 
 folder = Path(args.output)
 folder.mkdir(parents=True, exist_ok=False)
@@ -59,6 +59,8 @@ finally:
     state["cdp"] = measured_calls
     state["source_hashes"] = source_hashes
     state["task_hash"] = hashlib.sha256(json.dumps([URL, GOALS]).encode()).hexdigest()
+    # The task rolls forward, so the hash alone no longer identifies it across days.
+    state["departure_date"] = DEPARTURE.isoformat()
     state["configuration"] = {
         key: os.environ.get(key)
         for key in ("TYPESAFE_MODEL", "TEXT_MODEL", "TEXT_MODEL_BASE_URL", "TEXT_MODEL_REASONING")
