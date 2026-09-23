@@ -2,6 +2,7 @@
 
 import hashlib
 import json
+import os
 import sys
 import time
 from pathlib import Path
@@ -20,11 +21,16 @@ class StalePage(ValueError):
 class Browser:
     def __init__(self, url):
         ensure_daemon()
-        self.target = cdp("Target.createTarget", url="about:blank", background=True)["targetId"]
+        # Background by default so a run does not steal the window. JEV_FOREGROUND=1 brings it to
+        # the front instead, for watching a run rather than reading it afterwards.
+        watching = os.environ.get("JEV_FOREGROUND") == "1"
+        self.target = cdp("Target.createTarget", url="about:blank", background=not watching)["targetId"]
         self.session = cdp("Target.attachToTarget", targetId=self.target, flatten=True)["sessionId"]
         self.call("Emulation.setDeviceMetricsOverride", width=1120, height=780, deviceScaleFactor=1, mobile=False)
         # Keep rAF/menus rendering in an owned background tab, without activating the user's Chrome tab.
         self.call("Emulation.setFocusEmulationEnabled", enabled=True)
+        if watching:
+            cdp("Target.activateTarget", targetId=self.target)
         self.call("Page.navigate", url=url)
         deadline = time.monotonic() + 15
         while time.monotonic() < deadline:
@@ -135,6 +141,9 @@ class Browser:
         return result
 
     def close(self):
+        if os.environ.get("JEV_KEEP_OPEN") == "1":
+            self.target = None  # leave the page up to be looked at
+            return
         if self.target:
             cdp("Target.closeTarget", targetId=self.target)
             self.target = None
