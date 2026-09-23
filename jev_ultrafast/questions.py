@@ -28,3 +28,8 @@ MAX_STEPS = 60
 # Retire a sub-goal at this reading. Measured on the flights task, satisfied steps read 0.92-0.97
 # and unsatisfied ones 0.02-0.09, so the threshold sits well clear of both.
 PLAN_SATISFIED = 0.8
+
+# How far back to look for a control being chosen without effect, and how many such choices make
+# it fixation. Two inside three keeps one ineffective retry, which is often legitimate.
+FIXATION_WINDOW = 3
+FIXATION_REPEATS = 2

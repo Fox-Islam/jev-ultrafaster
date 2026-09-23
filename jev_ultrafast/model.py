@@ -137,8 +137,18 @@ def read_plan_answers(answers, pending):
     return read
 
 
-def choose(state, goal, history, pending=()):
+def choose(state, goal, history, pending=(), suppress=()):
     elements, targets, controls = action_space(state["actions"])
+    # A control that has been chosen repeatedly without moving the page is not going to move it
+    # this time either. Withholding it costs nothing and forces the next-best answer.
+    if suppress:
+        targets = {
+            operation: kept
+            for operation, candidates in targets.items()
+            if (kept := {i: a for i, a in candidates.items() if (a["label"], a["kind"]) not in suppress})
+        }
+        if not targets:  # never strand the agent: an empty action space can only answer BLOCKED
+            _, targets, _ = action_space(state["actions"])
     labels = {
         "CLICK": "Click an element, button, menu option, autocomplete suggestion, or calendar day.",
         "TYPE_TEXT": "Enter or replace text in an editable field. A small LLM will supply the value from the goal.",

@@ -6,7 +6,7 @@ from pathlib import Path
 
 from .browser import Browser, StalePage
 from .model import action_space, choose, field_context, field_text
-from .questions import MAX_STEPS, PLAN_SATISFIED
+from .questions import FIXATION_REPEATS, FIXATION_WINDOW, MAX_STEPS, PLAN_SATISFIED
 
 
 class Agent:
@@ -86,7 +86,11 @@ class Agent:
                 else []
             )
             state["decision"] = choose(
-                state["page"], state["goal"], state["history"], [state["plan"][i] for i in outstanding]
+                state["page"],
+                state["goal"],
+                state["history"],
+                [state["plan"][i] for i in outstanding],
+                self.fixated(),
             )
             # These readings describe the page this call saw, so a sub-goal retires in the same call
             # that measured it. Retiring is one-way: the question is not asked again.
@@ -184,6 +188,21 @@ class Agent:
         else:
             raise ValueError("Unknown command")
         return self.snapshot()
+
+    def fixated(self):
+        """Controls chosen more than once in the recent past without moving the page.
+
+        Costs nothing: `page_changed` is already recorded per action. It catches the shape that
+        stopped a round-trip run dead - "Open Return" chosen until the no-progress guard fired,
+        while the origin and destination were never attempted.
+        """
+        recent = self.state["history"][-FIXATION_WINDOW:]
+        seen = {}
+        for step in recent:
+            if step.get("page_changed") is False and step.get("kind") != "wait":
+                key = (step["action"], step["kind"])
+                seen[key] = seen.get(key, 0) + 1
+        return {key for key, count in seen.items() if count >= FIXATION_REPEATS}
 
     def run(self):
         while self.state["status"] not in {"done", "blocked"}:

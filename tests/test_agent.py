@@ -348,3 +348,55 @@ def test_a_fully_satisfied_plan_ends_the_run_without_acting(runner):
     out = runner.command("act", {"fingerprint": runner.state["page"]["fingerprint"]})
     assert out["status"] == "done"
     runner.state["browser"].act.assert_not_called()
+
+
+def history_step(label, changed, kind="click"):
+    return {"action": label, "kind": kind, "page_changed": changed}
+
+
+@pytest.mark.parametrize(
+    "steps,expected",
+    [
+        ([history_step("Open Return", False), history_step("Open Return", False)], {("Open Return", "click")}),
+        ([history_step("Open Return", True), history_step("Open Return", False)], set()),
+        ([history_step("Open Return", False), history_step("Search", False)], set()),
+        ([history_step("Wait", False, "wait"), history_step("Wait", False, "wait")], set()),
+    ],
+)
+def test_a_control_chosen_twice_without_effect_is_fixation(runner, steps, expected):
+    runner.state["history"] = steps
+    assert runner.fixated() == expected
+
+
+def test_a_suppressed_control_cannot_be_chosen(monkeypatch):
+    def post(_url, _key, body):
+        answers = {"operation": choice(body["questions"]["operation"]["criteria"], "CLICK")}
+        target = body["questions"].get("click_target")
+        if target:  # one remaining candidate is taken directly, so the head may not be asked
+            answers["click_target"] = choice(target["criteria"], next(iter(target["criteria"])))
+        return {"model": "test", "answers": answers}
+
+    monkeypatch.setenv("TYPESAFE_API_KEY", "test")
+    monkeypatch.setattr(model, "post_json", post)
+    # "Go" is e3; withholding it must leave the other click, never the suppressed one.
+    assert model.choose(page(), "Find a book", [], (), {("Go", "click")})["choice"] == "e2"
+
+
+def test_suppression_never_empties_the_action_space(monkeypatch):
+    sent = {}
+
+    def post(_url, _key, body):
+        sent.update(body)
+        return {
+            "model": "test",
+            "answers": {
+                "operation": choice(body["questions"]["operation"]["criteria"], "CLICK"),
+                "click_target": choice(body["questions"]["click_target"]["criteria"], "1"),
+            },
+        }
+
+    monkeypatch.setenv("TYPESAFE_API_KEY", "test")
+    monkeypatch.setattr(model, "post_json", post)
+    everything = {("Open Search", "click"), ("Go", "click"), ("Search", "fill")}
+    model.choose(page(), "Find a book", [], (), everything)
+    assert sent["questions"]["click_target"]["criteria"]  # fell back rather than stranding the run
