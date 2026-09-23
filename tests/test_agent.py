@@ -9,6 +9,7 @@ from unittest.mock import Mock
 import pytest
 
 from jev_ultrafast import agent as loop
+from jev_ultrafast import browser as browser_module
 from jev_ultrafast import model
 from jev_ultrafast.browser import StalePage, browser_operation, fingerprint
 
@@ -400,3 +401,24 @@ def test_suppression_never_empties_the_action_space(monkeypatch):
     everything = {("Open Search", "click"), ("Go", "click"), ("Search", "fill")}
     model.choose(page(), "Find a book", [], (), everything)
     assert sent["questions"]["click_target"]["criteria"]  # fell back rather than stranding the run
+
+
+def observation(url="https://example.test/", actions=None, expanded=None):
+    acts = [{"id": f"e{i}", "kind": "click", "label": f"c{i}", "node": i} for i in range(actions or 10)]
+    for a in acts[:expanded or 0]:
+        a["expanded"] = "true"
+    return {"url": url, "actions": acts}
+
+
+@pytest.mark.parametrize(
+    "before,after,expected,why",
+    [
+        (observation(), observation(url="https://example.test/next"), True, "navigation"),
+        (observation(expanded=0), observation(expanded=1), True, "a menu or dialog opened"),
+        (observation(actions=10), observation(actions=14), True, "what is on offer changed a lot"),
+        (observation(actions=10), observation(actions=12), False, "a small change is not arrival"),
+        (observation(), observation(), False, "nothing changed"),
+    ],
+)
+def test_only_arriving_pages_are_waited_for(before, after, expected, why):
+    assert browser_module.unsettling(before, after) is expected, why

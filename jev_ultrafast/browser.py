@@ -97,21 +97,28 @@ class Browser:
             return current == [page["page_key"], page["guards"].get(str(node))]
         return self.evaluate(MARKER) == page["marker"]
 
-    def settle(self, screenshot=False, timeout=6.0):
-        """Observe until the page stops moving, so a decision is taken on a page that will still
-        be current when it is acted on.
+    def settle(self, screenshot=False, timeout=6.0, previous=None, stabilise=False):
+        """Observe until the page can be acted on, and wait for it to stop moving only when the
+        last action was the kind that keeps a page moving.
 
-        A single-page app keeps hydrating after its route change. The first observation can carry
-        no actions at all, and one taken mid-hydration is stale before the answer returns. Each
-        costs a model call: an empty action space can only be answered BLOCKED, and a stale
-        terminal answer is discarded and re-asked."""
+        Waiting for an operable page is what removes a wasted call: an empty action space can only
+        be answered BLOCKED. Waiting further costs protocol calls, which is what this reader exists
+        to keep down, so it is spent only after a transition that tends to stream content in - a
+        navigation, a menu or dialog opening, or a large change in what is on offer. A fingerprint
+        change is deliberately not a trigger: it moves when a field is typed into or the page is
+        scrolled, neither of which means the page is still arriving.
+        """
         deadline = time.monotonic() + timeout
         page = self.observe(screenshot=screenshot)
+        while not operable(page) and time.monotonic() < deadline:
+            time.sleep(0.15)
+            page = self.observe(screenshot=screenshot)
+        if not (stabilise or previous is None or unsettling(previous, page)):
+            return page
         held = 0
         while time.monotonic() < deadline:
             time.sleep(0.3)
             following = self.observe(screenshot=screenshot)
-            # Hydration has quiet moments, so one repeated fingerprint is not stability.
             held = held + 1 if following["fingerprint"] == page["fingerprint"] else 0
             page = following
             if held >= 3 and operable(page):
@@ -131,6 +138,20 @@ class Browser:
         if self.target:
             cdp("Target.closeTarget", targetId=self.target)
             self.target = None
+
+
+def expanded(page):
+    return sum(1 for action in page["actions"] if str(action.get("expanded")).lower() == "true")
+
+
+def unsettling(previous, current):
+    """Whether the change between two observations is the kind that keeps arriving."""
+    if previous["url"] != current["url"]:
+        return True
+    if expanded(current) > expanded(previous):
+        return True
+    before, after = len(previous["actions"]), len(current["actions"])
+    return abs(after - before) >= max(3, before // 10)
 
 
 def operable(page):

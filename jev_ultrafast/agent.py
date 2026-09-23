@@ -65,7 +65,7 @@ class Agent:
             except StalePage:
                 state["decision"] = None
                 state["status"] = "ready"
-                state["page"] = state["browser"].settle(screenshot=self.screenshots)
+                state["page"] = state["browser"].settle(screenshot=self.screenshots, stabilise=True)
                 state["elapsed_ms"] = round((time.perf_counter() - state["started_at"]) * 1000)
                 return self.snapshot()
         elif name == "predict":
@@ -74,7 +74,7 @@ class Agent:
             if state["started_at"] is None:
                 state["started_at"] = time.perf_counter()
             if not state["browser"].fresh(state["page"]):
-                state["page"] = state["browser"].settle(screenshot=self.screenshots)
+                state["page"] = state["browser"].settle(screenshot=self.screenshots, stabilise=True)
             state["decision"] = None
             if state["status"] in {"done", "blocked"}:
                 raise ValueError("This run has stopped. Start a fresh demo.")
@@ -168,7 +168,7 @@ class Agent:
                     "elapsed_ms": state["elapsed_ms"],
                 }
             )
-            state["page"] = state["browser"].settle(screenshot=self.screenshots)
+            state["page"] = state["browser"].settle(screenshot=self.screenshots, previous=page)
             state["elapsed_ms"] = round((time.perf_counter() - state["started_at"]) * 1000)
             state["history"][-1].update(
                 page_changed=state["page"]["fingerprint"] != page["fingerprint"],
