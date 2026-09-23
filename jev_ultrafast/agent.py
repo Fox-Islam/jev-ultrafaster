@@ -252,9 +252,11 @@ class Agent:
                 continue
             if action["kind"] == "fill" and action.get("value"):
                 continue  # already carries a value; re-typing it is not progress
-            # One reuse per call: satisfaction readings are only refreshed when Jev is asked, so
-            # after acting on a held answer nothing knows which sub-goals are still outstanding.
-            self.held = {}
+            # Retire only the answer being used. The throttle that cleared every held answer
+            # after one reuse was protecting against stale satisfaction readings, but an answer is
+            # re-resolved against the current page before it is used, and a filled field is
+            # skipped, so the guards already cover what the throttle was standing in for.
+            self.held.pop(index, None)
             return {
                 "choice": action["id"],
                 "operation": entry["operation"],
