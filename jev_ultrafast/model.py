@@ -107,14 +107,14 @@ def action_space(actions):
     return elements, targets, controls
 
 
-def plan_questions(pending):
+def plan_questions(pending, operations, targets, settled):
     """One satisfaction check per outstanding sub-goal.
 
     These ride in the request that was being sent anyway. A whole-task DONE is one broad judgement
     and answers weakly when the page could arguably be said to satisfy the goal already; a sub-goal
     asks something narrow enough to answer sharply.
     """
-    return {
+    questions = {
         f"plan{offset}_satisfied": {
             "type": "noul",
             "instructions": f"Is this step already satisfied on the page as it stands?\n\nStep: {text}",
@@ -125,15 +125,48 @@ def plan_questions(pending):
         }
         for offset, text in enumerate(pending)
     }
+    # A full decision per outstanding sub-goal. Asking costs almost nothing next to a round trip,
+    # and an answer that is still applicable when its turn comes replaces the call that turn needs.
+    for offset, text in enumerate(pending):
+        questions[f"plan{offset}_operation"] = {
+            "type": "choice", "criteria": operations, "instructions": flatten_instructions(text, NEXT_ACTION),
+        }
+        for operation, candidates in targets.items():
+            if operation in settled:
+                continue
+            questions[f"plan{offset}_{operation.lower()}_target"] = {
+                "type": "choice",
+                "criteria": {index: describe_target(index, a) for index, a in candidates.items()},
+                "instructions": flatten_instructions(text, [NEXT_ACTION, TARGET], operation),
+            }
+    return questions
 
 
-def read_plan_answers(answers, pending):
+def read_plan_answers(answers, pending, operations, targets, settled):
     """Probability that each outstanding sub-goal is already satisfied, or None if unreadable.
     A malformed reading must not stop the run, so it is dropped rather than raised."""
     read = []
     for offset in range(len(pending)):
         value = answers.get(f"plan{offset}_satisfied", {}).get("noul")
-        read.append(value if isinstance(value, (int, float)) and 0 <= value <= 1 else None)
+        satisfied = value if isinstance(value, (int, float)) and 0 <= value <= 1 else None
+        entry = {"satisfied": satisfied, "operation": None, "label": None, "kind": None, "confidence": None}
+        try:
+            answer = validate_choice(answers.get(f"plan{offset}_operation", {}), operations)
+            entry["operation"], entry["confidence"] = answer["choice"], answer["confidence"]
+            group = targets.get(entry["operation"])
+            if group is not None:
+                if entry["operation"] in settled:
+                    action = group[settled[entry["operation"]]]
+                else:
+                    target = validate_choice(
+                        answers.get(f"plan{offset}_{entry['operation'].lower()}_target", {}), group
+                    )
+                    action = group[target["choice"]]
+                # Held by label and kind, never by node id: an id survives a change of meaning.
+                entry["label"], entry["kind"] = action["label"], action["kind"]
+        except (ValueError, KeyError):
+            entry["label"] = None
+        read.append(entry)
     return read
 
 
@@ -161,7 +194,7 @@ def choose(state, goal, history, pending=()):
             "criteria": {index: describe_target(index, a) for index, a in candidates.items()},
             "instructions": flatten_instructions(goal, [NEXT_ACTION, TARGET], operation),
         }
-    questions.update(plan_questions(pending))
+    questions.update(plan_questions(pending, operations, targets, settled))
     body = {
         "model": os.environ.get("TYPESAFE_MODEL", "jev-latest"),
         "state": {
@@ -202,7 +235,7 @@ def choose(state, goal, history, pending=()):
         "operation_probabilities": operation_answer["probabilities"],
         "target_probabilities": target_answer["probabilities"] if target_answer else {},
         "target_confidence": target_answer["confidence"] if target_answer else None,
-        "plan": read_plan_answers(result["answers"], pending),
+        "plan": read_plan_answers(result["answers"], pending, operations, targets, settled),
         "raw_answers": result["answers"],
         "model": result["model"],
         "usage": result.get("usage", {}),
