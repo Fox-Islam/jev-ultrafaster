@@ -428,3 +428,20 @@ def observation(url="https://example.test/", actions=None, expanded=None):
 )
 def test_only_arriving_pages_are_waited_for(before, after, expected, why):
     assert browser_module.unsettling(before, after) is expected, why
+
+
+def test_an_unusable_field_value_is_retried_not_fatal(runner, monkeypatch):
+    # The helper is called before any input is sent, so re-deciding is not a mutation retry.
+    monkeypatch.setattr(loop, "field_text", Mock(side_effect=ValueError("no valid field value")))
+    runner.text_failures = 0
+    with pytest.raises(StalePage):
+        runner.command("act", {"fingerprint": runner.state["page"]["fingerprint"]})
+    runner.state["browser"].act.assert_not_called()
+    assert runner.state["status"] == "ready"
+
+
+def test_a_persistently_unusable_field_value_stops_the_run(runner, monkeypatch):
+    monkeypatch.setattr(loop, "field_text", Mock(side_effect=ValueError("no valid field value")))
+    runner.text_failures = 99
+    with pytest.raises(ValueError, match="no valid field value"):
+        runner.command("act", {"fingerprint": runner.state["page"]["fingerprint"]})

@@ -6,7 +6,7 @@ from pathlib import Path
 
 from .browser import Browser, StalePage
 from .model import action_space, choose, field_context, field_text
-from .questions import FIXATION_REPEATS, FIXATION_WINDOW, MAX_STEPS, PLAN_SATISFIED
+from .questions import FIXATION_REPEATS, FIXATION_WINDOW, MAX_STEPS, PLAN_SATISFIED, TEXT_ATTEMPTS
 
 
 class Agent:
@@ -26,6 +26,7 @@ class Agent:
         self.reuse_held_answers = reuse_held
         self.reused = 0
         self.pending_text = None
+        self.text_failures = 0
         self.browser = Browser(url)
         self.record_dir = Path(record_dir) if record_dir else None
         self.screenshots = screenshots or bool(record_dir)
@@ -157,7 +158,17 @@ class Agent:
                 if self.pending_text and self.pending_text[0] == context:
                     _, text, helper = self.pending_text
                 else:
-                    text, helper = field_text(context)
+                    try:
+                        text, helper = field_text(context)
+                    except ValueError:
+                        # The helper answered with nothing usable. No input has been sent yet, so
+                        # this decision can simply be taken again; it is not a mutation retry.
+                        self.text_failures += 1
+                        if self.text_failures > TEXT_ATTEMPTS:
+                            raise
+                        state["status"] = "ready"
+                        raise StalePage("Text helper gave nothing usable. Choose again.") from None
+                    self.text_failures = 0
                     self.pending_text = (context, text, helper)
                     state["text_calls"].append({**helper, "field": action["label"], "value": text})
             # Browser.act checks freshness immediately before input, including after text generation.

@@ -33,3 +33,6 @@ PLAN_SATISFIED = 0.8
 # it fixation. Two inside three keeps one ineffective retry, which is often legitimate.
 FIXATION_WINDOW = 3
 FIXATION_REPEATS = 2
+
+# How many times a field value may come back unusable before the run gives up on it.
+TEXT_ATTEMPTS = 2
