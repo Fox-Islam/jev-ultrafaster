@@ -14,6 +14,11 @@ from browser_harness.helpers import cdp
 READ_STATE = Path(__file__).with_name("snapshot.js").read_text()
 MARKER = f"(() => {{ const state={READ_STATE}; return state?.marker ?? null; }})()"
 
+# A frame narrower or shorter than this, or starting beyond the window, carries nothing a decision
+# could act on. The window matches the size the page is emulated at.
+USABLE_FRAME = 60
+VIEWPORT = (1120, 780)
+
 class StalePage(ValueError):
     """A decision no longer refers to the observed page."""
 
@@ -72,6 +77,12 @@ class Browser:
                 box = self.call("DOM.getBoxModel", backendNodeId=owner["backendNodeId"])["model"]["content"]
             except (RuntimeError, KeyError):
                 continue  # not ours, or gone between listing and attaching
+            # A frame too small or too far off-screen to be used is not worth reading. Tracking
+            # pixels and advertising slots are most of the frames on a page and none of its work,
+            # and each one read costs a call whose answer can never be acted on.
+            width, height = box[2] - box[0], box[7] - box[1]
+            if width < USABLE_FRAME or height < USABLE_FRAME or box[0] > VIEWPORT[0] or box[1] > VIEWPORT[1]:
+                continue
             found.append({"session": session, "offset": (box[0], box[1])})
         return found
 
