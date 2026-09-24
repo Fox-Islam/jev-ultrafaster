@@ -136,6 +136,17 @@ class Browser:
                 time.sleep(0.02)
         raise StalePage("Page did not settle")
 
+    def worth_reading_frames(self, page):
+        """Whether to spend calls looking inside this page's frames.
+
+        Reading them costs a listing plus two measurements and a read for each frame, every
+        observation - about a third more protocol calls on a page full of advertising slots, for
+        nothing, because its own controls were all readable anyway. A page that offers nothing is
+        the one that needs it: the content may be in a frame, as it is on a review surface where
+        the site under review is proxied into one, and the alternative is answering BLOCKED.
+        """
+        return os.environ.get("JEV_FRAMES") == "1" or not operable(page)
+
     def read(self, screenshot):
         """One observation of the page and of every cross-origin frame in it, as a single state.
 
@@ -143,6 +154,9 @@ class Browser:
         from one and a decision has to say which frame it is about. Each action carries the session
         that owns it and where its frame sits, so it can be validated and executed later.
         """
+        page = browser_operation({"operation": "observe", "session": self.session, "screenshot": screenshot})
+        if not self.worth_reading_frames(page):
+            return page
         merged = None
         for index, frame in enumerate(self.frames()):
             state = browser_operation(
