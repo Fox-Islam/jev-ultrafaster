@@ -65,6 +65,26 @@ Open **http://127.0.0.1:8766** and click **Start demo → Run automatically**. T
 
 Chrome connects through [Browser Harness](https://github.com/browser-use/browser-harness), installed by `uv sync`. Run `uv run browser-harness --doctor` if it needs connecting. Allow remote debugging in Chrome when prompted.
 
+### Replaying a run
+
+A run's actions can be written out and run back without the model:
+
+```bash
+uv run python scripts/replay.py record form.json --url https://example.test/signup \
+    --goal "Set the first name field to Ada" --goal "Set the email field to ada@example.com"
+uv run python scripts/replay.py run form.json
+```
+
+A script names the controls it used; it carries no element ids, because a node id identifies
+nothing on a page loaded again. Each step is resolved against the page in front of it, so a step
+naming no control, or more than one, stops the replay instead of guessing between them.
+
+`jev_ultrafast.replay.script(agent.snapshot())` returns the same document for a run driven from
+the library, and `replay(document, browser=...)` runs one into a browser already open.
+
+Replaying the five-field form takes 0.7-1.1s and makes no model calls, against ~2.5s and three
+calls to decide it the first time.
+
 ### A hosted browser
 
 `BU_CDP_WS` points the harness at a remote CDP endpoint instead of local Chrome. An endpoint that

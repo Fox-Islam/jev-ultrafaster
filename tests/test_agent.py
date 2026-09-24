@@ -11,6 +11,7 @@ import pytest
 from jev_ultrafast import agent as loop
 from jev_ultrafast import browser as browser_module
 from jev_ultrafast import model
+from jev_ultrafast import replay as replay_module
 from jev_ultrafast.browser import StalePage, browser_operation, fingerprint
 
 
@@ -663,3 +664,79 @@ def test_a_setting_that_is_not_a_json_object_sends_nothing(monkeypatch, setting)
     # Nothing is invented from a malformed value: the endpoint then refuses the handshake, which
     # names the endpoint, where a half-built header would name nothing.
     assert daemon.cdp_headers() == {}
+
+
+def recorded_state():
+    return {
+        "url": "https://example.test/start",
+        "goal": "Fill the form",
+        "history": [
+            {"step": 1, "action": "Search", "kind": "fill", "text": "Ada", "url": "https://example.test/start",
+             "choice": "0:e1", "probability": 0.9},
+            {"step": 2, "action": "Go", "kind": "click", "text": None, "url": "https://example.test/start"},
+        ],
+    }
+
+
+def test_a_script_names_controls_and_keeps_no_element_ids():
+    document = replay_module.script(recorded_state(), name="demo")
+    assert document["url"] == "https://example.test/start"
+    assert document["steps"] == [
+        {"kind": "fill", "label": "Search", "text": "Ada"},
+        {"kind": "click", "label": "Go"},
+    ]
+    # A node id means nothing on a page loaded again, so nothing carries one.
+    assert "choice" not in json.dumps(document) and "e1" not in json.dumps(document)
+
+
+def test_a_script_falls_back_to_the_first_page_a_run_acted_on():
+    state = recorded_state()
+    del state["url"]
+    assert replay_module.script(state)["url"] == "https://example.test/start"
+
+
+def test_a_replay_resolves_each_step_against_the_page_in_front_of_it():
+    acted, pages = [], [page(), page(), page()]
+    browser = Mock(
+        settle=Mock(side_effect=lambda **kw: pages.pop(0) if pages else page()),
+        act=Mock(side_effect=lambda action, page, text=None: acted.append((action["id"], text))),
+    )
+    document = replay_module.script(recorded_state())
+    document["steps"] = [{"kind": "fill", "label": "Search", "text": "Ada"}, {"kind": "click", "label": "Go"}]
+    done = replay_module.replay(document, browser=browser)
+    assert acted == [("e1", "Ada"), ("e3", None)]
+    assert [step["step"] for step in done] == [1, 2]
+    browser.close.assert_not_called()  # a borrowed browser is left open
+
+
+def test_a_replay_stops_when_a_step_names_nothing_on_the_page():
+    browser = Mock(settle=Mock(return_value=page()))
+    document = {"version": replay_module.VERSION, "url": "https://example.test/",
+                "steps": [{"kind": "click", "label": "Nowhere"}]}
+    with pytest.raises(ValueError, match="matched 0 controls"):
+        replay_module.replay(document, browser=browser)
+    browser.act.assert_not_called()
+
+
+def test_a_replay_stops_when_a_step_names_more_than_one_control():
+    twice = page()
+    twice["actions"].append({**twice["actions"][2], "id": "e9"})
+    browser = Mock(settle=Mock(return_value=twice))
+    document = {"version": replay_module.VERSION, "url": "https://example.test/",
+                "steps": [{"kind": "click", "label": "Go"}]}
+    with pytest.raises(ValueError, match="matched 2 controls"):
+        replay_module.replay(document, browser=browser)
+    browser.act.assert_not_called()
+
+
+def test_a_script_from_another_version_is_refused(tmp_path):
+    path = tmp_path / "script.json"
+    path.write_text(json.dumps({"version": replay_module.VERSION + 1, "url": "https://x.test/", "steps": []}))
+    with pytest.raises(ValueError, match="is not"):
+        replay_module.read(path)
+
+
+def test_a_script_round_trips_through_a_file(tmp_path):
+    path = tmp_path / "script.json"
+    replay_module.write(recorded_state(), path, name="demo")
+    assert replay_module.read(path)["steps"][0]["text"] == "Ada"

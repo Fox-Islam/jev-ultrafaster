@@ -44,6 +44,7 @@ class Agent:
             raise
         self.state = dict(
             browser=self.browser,
+            url=url,
             goal="\n".join(plan),
             page=page,
             decision=None,
