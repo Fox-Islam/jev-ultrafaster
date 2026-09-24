@@ -33,11 +33,13 @@ def record(args):
 def run(args):
     document = read(args.path)
     print(f"replaying {len(document['steps'])} steps from {document['url']}", flush=True)
-    done = replay(document, on_step=lambda step: print(
+    result = replay(document, on_step=lambda step: print(
         f"  {step['elapsed_ms']:>6}ms {step['kind']:<7} {step['label'][:48]!r}"
         f"{'' if step['page_changed'] else '  (page unchanged)'}", flush=True))
-    print(json.dumps({"steps": len(done), "ms": done[-1]["elapsed_ms"] if done else 0}))
-    return 0
+    steps = result["steps"]
+    print(json.dumps({"status": result["status"], "completed": result["completed"],
+                      "ms": steps[-1]["elapsed_ms"] if steps else 0}))
+    return 0 if result["status"] == "done" else 1
 
 
 def main():

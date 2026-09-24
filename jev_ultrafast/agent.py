@@ -5,16 +5,38 @@ import os
 import threading
 import time
 from pathlib import Path
+from urllib.parse import urlparse
 
-from .browser import RESTLESS, Browser, StalePage, operable
-from .model import action_space, choose, field_context, field_text, field_values
-from .questions import FIXATION_REPEATS, FIXATION_WINDOW, MAX_STEPS, PLAN_SATISFIED, TEXT_ATTEMPTS
+from . import session
+from .browser import RESTLESS, Browser, StalePage, diagnosis, operable
+from .model import action_space, choose, field_context, field_text, field_values, readable_only, unseen
+from .questions import (
+    EVIDENCE_TEXT,
+    FIXATION_REPEATS,
+    FIXATION_WINDOW,
+    MAX_STEPS,
+    PLAN_SATISFIED,
+    TEXT_ATTEMPTS,
+    UNSEEN_ENOUGH,
+)
 
 
 class Agent:
-    def __init__(self, url, goals, *, record_dir=None, screenshots=False, track_plan=False, reuse_held=True):
+    def __init__(self, url, goals, *, browser=None, record_dir=None, screenshots=False, track_plan=False,
+                 reuse_held=True, read_only=False, allowed_hosts=None, max_steps=MAX_STEPS,
+                 queries=(), keep_open_s=0):
         steps = [goals] if isinstance(goals, str) else list(goals)
-        steps = [step.strip() for step in steps if step and step.strip()]
+        # A goal list may carry questions for the page as well as things to do. A question is
+        # asked once everything named before it is satisfied, so a caller can read the page part
+        # way through rather than only at the end.
+        self.asked, wanted = [], []
+        for step in steps:
+            if isinstance(step, dict) and step.get("query"):
+                self.asked.append({"query": step["query"], "after": len(wanted)})
+            elif isinstance(step, str) and step.strip():
+                wanted.append(step.strip())
+        self.asked += [{"query": query, "after": len(wanted)} for query in (queries or ())]
+        steps = wanted
         task = "\n".join(steps)
         if not task:
             raise ValueError("Supply a task")
@@ -34,13 +56,25 @@ class Agent:
         self.guessing, self.guessed = None, None
         self.unfresh_since = None
         self.guesses, self.guesses_used = 0, 0
-        self.browser = Browser(url)
+        self.read_only = read_only
+        # Matched on suffix, so naming a site covers its subdomains without listing them.
+        self.allowed_hosts = tuple(host.lower().lstrip(".") for host in (allowed_hosts or ()))
+        self.max_steps = max_steps
+        self.keep_open_s = keep_open_s
+        self.answered = {}
+        # A browser passed in is borrowed: it keeps whatever page it is on unless a url says
+        # otherwise, and it outlives this agent, so a run can continue where another left off.
+        self.borrowed = browser is not None
+        self.browser = browser or Browser(url)
+        if self.borrowed and url:
+            self.browser.navigate(url)
         self.record_dir = Path(record_dir) if record_dir else None
         self.screenshots = screenshots or bool(record_dir)
         try:
             page = self.browser.settle(screenshot=self.screenshots)
         except Exception:
-            self.browser.close()
+            if not self.borrowed:
+                self.browser.close()
             raise
         self.state = dict(
             browser=self.browser,
@@ -50,6 +84,8 @@ class Agent:
             decision=None,
             history=[],
             status="ready",
+            evidence=None,
+            reason=None,
             plan=plan,
             plan_index=0,
             decisions=[],
@@ -62,9 +98,26 @@ class Agent:
             self.record_dir.mkdir(parents=True, exist_ok=True)
             (self.record_dir / "000000.jpg").write_bytes(base64.b64decode(page["screenshot"]))
 
+    STOPPED = {"done", "blocked", "budget", "off_site"}
+
     def snapshot(self):
+        browser = self.state.get("browser")
+        if browser is not None and getattr(self, "asked", None):
+            self.ask_due(self.state)
+        if browser is not None and self.state.get("status") in self.STOPPED and not self.state.get("evidence"):
+            # Every stopped run says what the page was, not only the ones that found something.
+            self.state["evidence"] = self.evidence(self.state)
+        if (browser is not None and self.state.get("status") in self.STOPPED
+                and getattr(self, "keep_open_s", 0) and not getattr(self, "handle", None)):
+            # Made when the run stops, not when it is closed: a caller reads the result before
+            # closing, and a handle that appears afterwards is a handle it never sees.
+            self.handle = session.handle_for(browser)
+        faults = getattr(self.state.get("browser"), "faults", None)
         return {
             **{k: v for k, v in self.state.items() if k != "browser"},
+            # After the state, which holds no faults of its own and would otherwise blank these.
+            "faults": diagnosis(faults) if isinstance(faults, dict) else {},
+            "handle": getattr(self, "handle", None),
             "elements": action_space(self.state["page"]["actions"])[0],
         }
 
@@ -102,6 +155,8 @@ class Agent:
                 self.reused += 1
                 state["status"] = "predicted"
                 return self.snapshot()
+            if getattr(self, "read_only", False):
+                state["page"] = dict(state["page"], actions=readable_only(state["page"]["actions"]))
             asked_about = state["page"]
             arguments = (
                 state["goal"],
@@ -156,14 +211,23 @@ class Agent:
                 if not self.settled_or_restless(page):
                     state["status"] = "ready"
                     raise StalePage("Page changed since the decision. Choose again.")
-                state["status"] = "done" if selected == "DONE" else "blocked"
+                if selected == "DONE":
+                    state["status"] = "done"
+                else:
+                    state["status"] = "blocked"
+                    # A page read to the bottom without the thing on it is a different answer from
+                    # one abandoned part way down, and a planner can only act on the difference.
+                    state["reason"] = "stuck" if unseen(page) >= UNSEEN_ENOUGH else "not_found"
                 state["plan_index"] = int(selected == "DONE")
                 state["elapsed_ms"] = round((time.perf_counter() - state["started_at"]) * 1000)
                 return self.snapshot()
             action = next(a for a in page["actions"] if a["id"] == selected)
-            if len(state["history"]) >= MAX_STEPS:
-                state["status"] = "blocked"
-                raise ValueError(f"Stopped at the {MAX_STEPS}-action demo budget")
+            if len(state["history"]) >= getattr(self, "max_steps", MAX_STEPS):
+                # A budget reached is an outcome, not a fault: a caller cannot tell one from a
+                # broken run when both arrive as an exception.
+                state["status"] = "budget"
+                state["elapsed_ms"] = round((time.perf_counter() - state["started_at"]) * 1000)
+                return self.snapshot()
             text, helper = None, None
             if action["kind"] == "fill":
                 if not self.settled_or_restless(page):
@@ -229,12 +293,22 @@ class Agent:
             state["history"][-1].update(
                 page_changed=state["page"]["fingerprint"] != page["fingerprint"],
                 url=state["page"]["url"],
+                # Where the action left the page. Only the states run() yields carried this, so a
+                # finished run could not say whether a goal was missed below the fold.
+                scroll=dict(state["page"].get("scroll") or {}),
                 elapsed_ms=state["elapsed_ms"],
             )
             if state["record"]:
                 (self.record_dir / f"{state['elapsed_ms']:06d}.jpg").write_bytes(
                     base64.b64decode(state["page"]["screenshot"])
                 )
+            if self.off_site(state["page"]):
+                # Stopped where it went, not where it started: the caller needs the address that
+                # was refused to know which link took the run off the site.
+                state["status"] = "off_site"
+                state["refused_url"] = state["page"].get("url")
+                state["elapsed_ms"] = round((time.perf_counter() - state["started_at"]) * 1000)
+                return self.snapshot()
             repeated = state["history"][-3:]
             state["status"] = (
                 "blocked"
@@ -244,6 +318,59 @@ class Agent:
         else:
             raise ValueError("Unknown command")
         return self.snapshot()
+
+    def off_site(self, page):
+        """Whether this page is outside the hosts the run was allowed."""
+        allowed = getattr(self, "allowed_hosts", ())
+        if not allowed:
+            return False
+        host = urlparse(page.get("url") or "").hostname or ""
+        return not any(host.lower() == name or host.lower().endswith("." + name) for name in allowed)
+
+    def ask_due(self, state):
+        """Ask the questions whose goals are all satisfied, once each.
+
+        Read-only governs what this agent will do to a page, not what its caller may ask it: a
+        question is the caller's own code, and running it is the point of asking.
+        """
+        satisfied = len(state["plan"]) if state["status"] in {"done", "budget"} else len(self.plan_satisfied)
+        for index, question in enumerate(getattr(self, "asked", [])):
+            if index in self.answered or question["after"] > satisfied:
+                continue
+            self.answered[index] = state["browser"].ask(question["query"])
+        state["queries"] = [self.answered.get(i) for i in range(len(getattr(self, "asked", [])))]
+
+    def evidence(self, state):
+        """What the run is pointing at, taken from the page rather than written by the model.
+
+        A caller asking whether a page works needs the thing that answers it, and a model asked to
+        describe that would be writing the answer it is being checked against.
+        """
+        page, last = state["page"], (state["decisions"] or [{}])[-1]
+        named = state["browser"].identity()
+        faults = getattr(state["browser"], "faults", {}) or {}
+        # Always present, so a caller can tell a page that failed from one that is simply an image
+        # or a file, which answers no goal and has nothing on screen.
+        found = {
+            "url": page.get("url"),
+            "title": named.get("title") or page.get("title"),
+            "h1": named.get("h1"),
+            "document_status": faults.get("document_status"),
+            "document_type": faults.get("document_type"),
+        }
+        # DONE names no element, and the action before it is usually a scroll, so falling back to
+        # that reports the scrollbar as the evidence. Where nothing is named, the page speaks.
+        chosen = next((a for a in page["actions"] if a["id"] == last.get("choice")), None)
+        if chosen is not None:
+            found["element"] = {
+                "label": chosen.get("label"),
+                "role": chosen.get("role"),
+                "value": chosen.get("value"),
+                "text": (self.state["browser"].text_of(chosen) or "")[:EVIDENCE_TEXT],
+            }
+        else:
+            found["text"] = (page.get("text") or "")[:EVIDENCE_TEXT]
+        return found
 
     def restless(self):
         """Whether the page has gone so long without holding still that waiting is futile.
@@ -440,7 +567,29 @@ class Agent:
             yield self.command("tick")
 
     def close(self):
+        """Close the browser, unless it was passed in or is being kept open.
+
+        A borrowed browser is the caller's. A kept one stays, and so does this worker's claim on
+        the daemon: the page is still there to be asked about, and a second run would take the
+        browser from under it. `free` gives both back once the caller has finished with the page.
+        """
+        if getattr(self, "borrowed", False):
+            return
+        if getattr(self, "handle", None):
+            return  # the page is held; closing it is the handle holder's to do
         self.browser.close()
+
+    def free(self):
+        """Close a held page and report this worker free.
+
+        Called when the caller has finished with the handle. Safe when the page is already gone,
+        because a registry sweeping orphans cannot know what the worker closed on its way out.
+        """
+        handle = getattr(self, "handle", None)
+        closed = session.close_handle(handle) if handle else {}
+        self.handle = None
+        self.browser.release()
+        return closed
 
     def __enter__(self):
         return self

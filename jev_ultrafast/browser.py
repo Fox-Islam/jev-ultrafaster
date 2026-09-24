@@ -4,6 +4,7 @@ import hashlib
 import json
 import os
 import sys
+import threading
 import time
 from pathlib import Path
 
@@ -22,7 +23,10 @@ USABLE_FRAME = 60
 # a number of reads: three reads a third of a second apart is a second of stillness, and the same
 # three polled quickly is a seventh of one. A duration is unaffected by how often it is checked.
 SETTLE_STILL = float(os.environ.get("JEV_SETTLE_STILL", "0.3"))
-SETTLE_TIMEOUT = float(os.environ.get("JEV_SETTLE_TIMEOUT", "6"))
+# A hosted endpoint is reached over the network, where every look costs a round trip rather than
+# a pipe. Waiting is bounded harder there because the wait is what the round trips are spent on.
+REMOTE = bool(os.environ.get("BU_CDP_WS"))
+SETTLE_TIMEOUT = float(os.environ.get("JEV_SETTLE_TIMEOUT", "1.5" if REMOTE else "6"))
 SETTLE_POLL = float(os.environ.get("JEV_SETTLE_POLL", "0.05"))
 
 # How long the screen must go unpainted to count as still. The browser sends a frame when it
@@ -39,7 +43,23 @@ SETTLE_WATCH = float(os.environ.get("JEV_SETTLE_WATCH", "0.3"))
 # restless instead of arriving, and is acted on as it is.
 RESTLESS = float(os.environ.get("JEV_RESTLESS", "1.5"))
 SCREEN = {"format": "jpeg", "quality": 30, "maxWidth": 160, "maxHeight": 120, "everyNthFrame": 1}
-VIEWPORT = (1120, 780)
+VIEWPORT = (int(os.environ.get("JEV_VIEWPORT_WIDTH", "1120")), int(os.environ.get("JEV_VIEWPORT_HEIGHT", "780")))
+
+# How many of each kind of fault to keep. A page that fails one request per image would otherwise
+# report its whole gallery.
+FAULTS_KEPT = 25
+
+# How much of a query's answer to carry back. A caller asking a page a question wants what it
+# said, not the page; anything larger is a document being returned a field at a time.
+QUERY_LENGTH = int(os.environ.get("JEV_QUERY_LENGTH", "2048"))
+
+# What the page is, independent of anything a run did to it. A bare image answers every goal with
+# nothing on screen, which reads as a page that failed rather than a page that is an image.
+IDENTITY = """(() => {
+  const heading = document.querySelector('h1');
+  return {title: document.title || null,
+          h1: heading ? (heading.innerText || '').trim().slice(0, 300) : null};
+})()"""
 
 # The page keeps its own record of when it last changed, so how long it has been quiet is a
 # question instead of a wait. Polling can only establish stillness it watched: a page quiet for two
@@ -58,17 +78,62 @@ QUIET = """(() => {
 })()"""
 
 
+# Waiting for the document to hold still, inside the page. Polling costs a round trip per look,
+# which is nothing beside a local pipe and most of a remote wait: a page that never holds still
+# spent hundreds of calls establishing it. The page can watch itself and answer once.
+STILL = """((still, timeout) => new Promise(resolve => {
+  const began = performance.now();
+  const look = () => {
+    const quiet = """ + QUIET + """;
+    const waited = performance.now() - began;
+    if (quiet >= still || waited >= timeout) {
+      return resolve({still: quiet >= still, quiet: Math.round(quiet), waited: Math.round(waited)});
+    }
+    setTimeout(look, Math.max(10, Math.min(50, still - quiet)));
+  };
+  look();
+}))(%s, %s)"""
+
+
 class StalePage(ValueError):
     """A decision no longer refers to the observed page."""
 
 
+class DaemonBusy(RuntimeError):
+    """Another browser is already using this daemon."""
+
+
+# One browser at a time per daemon. The daemon keeps a single event buffer for every caller and
+# empties all of it on each drain, so a second browser reading events takes the first one's:
+# console errors and failed requests would be attributed to whichever run drained last. Nothing
+# in the protocol prevents that, so it is refused here.
+IN_USE = threading.Lock()
+
+
 class Browser:
-    def __init__(self, url):
+    def __init__(self, url, context=None):
+        if not IN_USE.acquire(blocking=False):
+            raise DaemonBusy(
+                "This daemon already has a browser. Its events are drained as one buffer, so a "
+                "second browser would take the first one's; run one browser per daemon."
+            )
+        self.holds_daemon = True
+        try:
+            self.open(url, context, watching=os.environ.get("JEV_FOREGROUND") == "1")
+        except BaseException:
+            self.release()
+            raise
+
+    def open(self, url, context, watching):
         ensure_daemon()
         # Background by default so a run does not steal the window. JEV_FOREGROUND=1 brings it to
         # the front instead, for watching a run live.
-        watching = os.environ.get("JEV_FOREGROUND") == "1"
-        self.target = cdp("Target.createTarget", url="about:blank", background=not watching)["targetId"]
+        # A run gets its own browser context, so the cookies and logins of the site before it do
+        # not carry into this one. A remote endpoint serves one customer after another through the
+        # same browser, where that would otherwise leak between them.
+        self.context = context if context is not None else self.own_context()
+        made = {"browserContextId": self.context} if self.context else {}
+        self.target = cdp("Target.createTarget", url="about:blank", background=not watching, **made)["targetId"]
         self.session = cdp("Target.attachToTarget", targetId=self.target, flatten=True)["sessionId"]
         width, height = VIEWPORT
         self.call(
@@ -76,17 +141,82 @@ class Browser:
         )
         # Keep rAF/menus rendering in an owned background tab, without activating the user's Chrome tab.
         self.call("Emulation.setFocusEmulationEnabled", enabled=True)
+        self.faults = {}
+        self.watch_faults()
         if watching:
             cdp("Target.activateTarget", targetId=self.target)
+        self.navigate(url)
+
+    def release(self):
+        """Give the daemon back. Idempotent, so closing twice is not an error."""
+        if getattr(self, "holds_daemon", False):
+            self.holds_daemon = False
+            IN_USE.release()
+
+    def watch_faults(self):
+        """Ask the page to report its console, its exceptions and its network.
+
+        These arrive as events, so nothing is spent per step to collect them: the wait already
+        drains the buffer, and what is not a screencast frame is read here instead of dropped.
+        """
+        for domain in ("Log", "Runtime", "Network", "Page"):
+            try:
+                self.call(f"{domain}.enable")
+            except (RuntimeError, KeyError):
+                pass
+
+    def note_fault(self, event):
+        """Record one event if it reports something wrong with the page."""
+        faults = getattr(self, "faults", None)
+        if faults is None:
+            faults = self.faults = {}
+        method, params = event.get("method"), event.get("params") or {}
+        if method == "Log.entryAdded":
+            entry = params.get("entry") or {}
+            if entry.get("level") in {"error", "warning"}:
+                faults.setdefault("console", []).append({
+                    "level": entry["level"], "text": (entry.get("text") or "")[:200], "url": entry.get("url"),
+                })
+        elif method == "Runtime.exceptionThrown":
+            details = params.get("exceptionDetails") or {}
+            thrown = (details.get("exception") or {}).get("description") or details.get("text") or ""
+            faults.setdefault("exceptions", []).append({"text": thrown[:200], "url": details.get("url")})
+        elif method == "Network.responseReceived":
+            response = params.get("response") or {}
+            if params.get("type") == "Document" and response.get("url"):
+                faults.setdefault("document_type", (response.get("mimeType") or "").split(";")[0] or None)
+            if (response.get("status") or 0) >= 400:
+                faults.setdefault("requests", []).append({
+                    "url": (response.get("url") or "")[:200], "status": response["status"],
+                })
+            if params.get("type") == "Document" and response.get("url"):
+                # The first document response is the page's own status; later ones are its frames.
+                faults.setdefault("document_status", response["status"])
+        elif method == "Network.loadingFailed":
+            faults.setdefault("requests", []).append({
+                "url": None, "status": None, "failed": (params.get("errorText") or "")[:80],
+            })
+
+    def own_context(self):
+        """A fresh browser context, or None where the browser will not make one."""
+        if os.environ.get("JEV_BROWSER_CONTEXT") == "0":
+            return None
+        try:
+            return cdp("Target.createBrowserContext", disposeOnDetach=False)["browserContextId"]
+        except (RuntimeError, KeyError):
+            return None
+
+    def call(self, method, **params):
+        return cdp(method, session_id=self.session, **params)
+
+    def navigate(self, url):
+        """Go to `url` and wait for the document to finish loading."""
         self.call("Page.navigate", url=url)
         deadline = time.monotonic() + 15
         while time.monotonic() < deadline:
             if self.evaluate("document.readyState") == "complete":
-                break
+                return
             time.sleep(0.02)
-
-    def call(self, method, **params):
-        return cdp(method, session_id=self.session, **params)
 
     def frames(self):
         """One session per cross-origin iframe worth reading, with where each sits on the page.
@@ -136,7 +266,19 @@ class Browser:
             raise StalePage("Document changed during evaluation")
         return response.get("result", {}).get("value")
 
-    def observe(self, screenshot=True):
+    def collect(self):
+        """Take what the page has reported since the last look.
+
+        Faults arrive as events whether or not a wait needed the screen, and an event left in the
+        buffer is one nobody reads. Draining on every observation keeps collection independent of
+        which wait ran.
+        """
+        try:
+            self.painted()
+        except (RuntimeError, OSError):
+            pass
+
+    def observe(self, screenshot=True, frames=True):
         if getattr(self, "after_input", None):
             action, self.after_input = self.after_input, None
             # This is read-only and happens after execution was logged, even if navigation interrupts it.
@@ -169,9 +311,10 @@ class Browser:
                 )
             except RuntimeError:
                 pass
+        self.collect()
         for attempt in range(10):
             try:
-                return self.read(screenshot)
+                return self.read(screenshot, frames)
             except StalePage:
                 if attempt == 9:
                     raise
@@ -198,7 +341,7 @@ class Browser:
             return True
         return not operable(page)
 
-    def read(self, screenshot):
+    def read(self, screenshot, frames=True):
         """One observation of the page, and of its frames when those are worth reading.
 
         Ids, guards and page keys are namespaced by frame whether or not any frame is read, because
@@ -208,7 +351,7 @@ class Browser:
         page that has moved.
         """
         merged = None
-        for index, frame in enumerate(self.frames_to_read(screenshot)):
+        for index, frame in enumerate(self.frames_to_read(screenshot, frames)):
             state = frame.pop("state", None) or browser_operation(
                 {"operation": "observe", "session": frame["session"], "screenshot": False}
             )
@@ -230,12 +373,19 @@ class Browser:
         merged["fingerprint"] = fingerprint(merged)
         return merged
 
-    def frames_to_read(self, screenshot):
+    def frames_to_read(self, screenshot, frames=True):
         """The page, plus its frames when they are worth the calls. The page's own observation is
-        carried along so it is never taken twice."""
+        carried along so it is never taken twice.
+
+        Finding the frames costs a listing and two measurements each, and their positions move
+        when the page scrolls, so the answer cannot be kept. `frames` is False for the readings
+        taken while waiting, which nothing is decided from: a wait only needs to know whether the
+        page has stopped, and the reading a decision is taken from is where frames are worth
+        finding.
+        """
         page = browser_operation({"operation": "observe", "session": self.session, "screenshot": screenshot})
         first = {"session": self.session, "offset": (0.0, 0.0), "state": page}
-        if not self.worth_reading_frames(page):
+        if not frames or not self.worth_reading_frames(page):
             return [first]
         return [first] + self.frames()
 
@@ -268,7 +418,7 @@ class Browser:
         reading taken along the way, so a caller can decide about a page before the wait ends.
         """
         deadline = time.monotonic() + (SETTLE_TIMEOUT if timeout is None else timeout)
-        page = self.observe(screenshot=screenshot)
+        page = self.observe(screenshot=screenshot, frames=False)
         if glimpse:
             # A reading taken while waiting is enough to decide from. The wait governs when to act,
             # not when to start deciding.
@@ -277,22 +427,33 @@ class Browser:
             # Whether anything can be acted on is a yes or no, not a window to wait out, so it is
             # asked as often as it is cheap to ask.
             time.sleep(SETTLE_POLL)
-            page = self.observe(screenshot=screenshot)
+            page = self.observe(screenshot=screenshot, frames=False)
             if glimpse:
                 glimpse(page)
         if not (stabilise or previous is None or unsettling(previous, page)):
-            return page
+            return self.observe(screenshot=screenshot)
         # If it has already been quiet for long enough, it is still, and watching would only
         # confirm what it has just said.
         if self.quiet_ms() >= SETTLE_STILL * 1000:
-            return page
+            return self.observe(screenshot=screenshot)
         watched = self.still_screen(screenshot, deadline, glimpse)
         if watched is not None:
-            return watched
+            return self.observe(screenshot=screenshot)
+        if REMOTE:
+            # The page reports its own stillness, so a wait of any length is one round trip. The
+            # deadline governs, as it does for polling.
+            while time.monotonic() < deadline:
+                held = self.held_still(deadline - time.monotonic())
+                page = self.observe(screenshot=screenshot, frames=False)
+                if glimpse:
+                    glimpse(page)
+                if operable(page) and (held is None or held["still"]):
+                    return self.observe(screenshot=screenshot)
+            return self.observe(screenshot=screenshot)
         still_since = None
         while time.monotonic() < deadline:
             time.sleep(SETTLE_POLL)
-            following = self.observe(screenshot=screenshot)
+            following = self.observe(screenshot=screenshot, frames=False)
             if glimpse:
                 glimpse(following)
             # Hydration has quiet moments, so a page counts as still once it has been unchanged
@@ -303,11 +464,17 @@ class Browser:
                 (still_since and time.monotonic() - still_since >= SETTLE_STILL)
                 or self.quiet_ms() >= SETTLE_STILL * 1000
             ):
-                return page
-        return page
+                return self.observe(screenshot=screenshot)
+        return self.observe(screenshot=screenshot)
 
     def watching_paint(self):
-        """Ask the browser to report its painting, once per page. False when it will not."""
+        """Ask the browser to report its painting, once per page. False when it will not.
+
+        Never on a remote endpoint: a frame is acknowledged one round trip at a time, and a page
+        that paints continuously spends more calls on acknowledging frames than on reading itself.
+        """
+        if REMOTE:
+            return False
         watching = getattr(self, "screencast", None)
         if watching is None:
             try:
@@ -332,6 +499,9 @@ class Browser:
             events = []
         for event in events:
             if event.get("method") != "Page.screencastFrame":
+                # The buffer holds one daemon's whole stream, and this browser owns it, so what is
+                # not a frame is this page reporting a fault.
+                self.note_fault(event)
                 continue
             self.last_paint = time.monotonic()
             try:
@@ -360,12 +530,95 @@ class Browser:
                     self.screencast = False
                     return None
             elif time.monotonic() - painted >= SETTLE_PAINT:
-                settled = self.observe(screenshot=screenshot)
+                settled = self.observe(screenshot=screenshot, frames=False)
                 if glimpse:
                     glimpse(settled)
                 return settled if operable(settled) else None
             time.sleep(0.01)
         return None
+
+    def text_of(self, action):
+        """The text inside an observed element, read from the node the reader kept.
+
+        Read from the page rather than described by a model: the caller is checking what the page
+        shows, and a description would be the thing under test writing its own evidence.
+        """
+        node = action.get("node")
+        if type(node) is not int:
+            return ""
+        try:
+            return self.evaluate(
+                f"(() => {{ const e = window.__jevFast?.nodes.get({node});"
+                " return e ? (e.innerText || e.value || '') : ''; })()",
+                session=action.get("session"),
+            ) or ""
+        except (StalePage, RuntimeError, KeyError):
+            return ""
+
+    def held_still(self, timeout):
+        """Wait in the page until it has been quiet for SETTLE_STILL, or until `timeout` passes.
+
+        One round trip covers the whole wait. None means the page could not answer - it navigated
+        out from under the question, or the connection refused it - and the caller looks again.
+        """
+        if timeout <= 0:
+            return None
+        try:
+            response = cdp(
+                "Runtime.evaluate",
+                session_id=self.session,
+                expression=STILL % (round(SETTLE_STILL * 1000), round(timeout * 1000)),
+                awaitPromise=True,
+                returnByValue=True,
+                # The call is held open for the whole wait, which outlasts the transport's own
+                # patience; without this a wait longer than five seconds fails as a dead daemon.
+                _response_timeout=timeout + 2,
+            )
+        except (RuntimeError, KeyError, OSError):
+            return None
+        if response.get("exceptionDetails"):
+            return None
+        answer = response.get("result", {}).get("value")
+        return answer if isinstance(answer, dict) else None
+
+    def ask(self, expression, cap=None):
+        """Run a caller's expression in the main frame and return what it answered.
+
+        A promise is awaited, so a query may look at something the page has yet to finish. The
+        answer is reported as a value or as the text of what it raised; either way the run carries
+        on, because a question that fails is an answer about the page.
+        """
+        cap = QUERY_LENGTH if cap is None else cap
+        try:
+            response = cdp(
+                "Runtime.evaluate",
+                session_id=self.session,
+                expression=expression,
+                awaitPromise=True,
+                returnByValue=True,
+                _response_timeout=30,
+            )
+        except (RuntimeError, OSError, KeyError) as refusal:
+            return {"exception": str(refusal)[:cap]}
+        details = response.get("exceptionDetails")
+        if details:
+            thrown = (details.get("exception") or {}).get("description") or details.get("text") or "failed"
+            return {"exception": str(thrown)[:cap]}
+        value = response.get("result", {}).get("value")
+        if isinstance(value, str):
+            return {"value": value[:cap]}
+        if value is None or isinstance(value, (int, float, bool)):
+            return {"value": value}
+        rendered = json.dumps(value, default=str)
+        return {"value": value} if len(rendered) <= cap else {"value": rendered[:cap]}
+
+    def identity(self):
+        """What the page is: its title and first heading, whatever a run made of it."""
+        try:
+            found = self.evaluate(IDENTITY)
+        except (StalePage, RuntimeError):
+            return {}
+        return found if isinstance(found, dict) else {}
 
     def quiet_ms(self):
         """How long the page reports going without changing. Zero when it cannot report."""
@@ -402,10 +655,40 @@ class Browser:
             self.screencast = None
         if os.environ.get("JEV_KEEP_OPEN") == "1":
             self.target = None  # leave the page up to be looked at
+            self.release()
             return
         if self.target:
             cdp("Target.closeTarget", targetId=self.target)
             self.target = None
+        if getattr(self, "context", None):
+            # Disposing takes the context's cookies and storage with it.
+            try:
+                cdp("Target.disposeBrowserContext", browserContextId=self.context)
+            except (RuntimeError, KeyError):
+                pass
+            self.context = None
+        self.release()
+
+
+def diagnosis(faults):
+    """What went wrong on the page, deduplicated and capped."""
+    seen, out = set(), {}
+    for kind in ("console", "exceptions", "requests"):
+        kept = []
+        for fault in faults.get(kind) or []:
+            key = (kind, fault.get("text"), fault.get("url"), fault.get("status"), fault.get("failed"))
+            if key in seen:
+                continue
+            seen.add(key)
+            kept.append(fault)
+            if len(kept) == FAULTS_KEPT:
+                break
+        if kept:
+            out[kind] = kept
+    for named in ("document_status", "document_type"):
+        if faults.get(named) is not None:
+            out[named] = faults[named]
+    return out
 
 
 def expanded(page):

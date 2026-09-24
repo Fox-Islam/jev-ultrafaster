@@ -1,5 +1,6 @@
 """Offline contracts for a dynamic operation/target policy. No paid APIs."""
 
+import importlib
 import json
 import time
 from copy import deepcopy
@@ -12,6 +13,7 @@ from jev_ultrafast import agent as loop
 from jev_ultrafast import browser as browser_module
 from jev_ultrafast import model
 from jev_ultrafast import replay as replay_module
+from jev_ultrafast import session as session_module
 from jev_ultrafast.browser import StalePage, browser_operation, fingerprint
 
 
@@ -410,7 +412,6 @@ def test_suppression_never_empties_the_action_space(monkeypatch):
     assert sent["questions"]["click_target"]["criteria"]  # fell back instead of stranding the run
 
 
-
 def test_an_unusable_field_value_is_retried_not_fatal(runner, monkeypatch):
     # The helper is called before any input is sent, so re-deciding is not a mutation retry.
     monkeypatch.setattr(loop, "field_text", Mock(side_effect=ValueError("no valid field value")))
@@ -539,7 +540,7 @@ def frame():
 def test_a_screen_that_stops_painting_settles_the_page(monkeypatch):
     b, calls = watched_browser(monkeypatch, [frame(), [], [], [], [], [], [], [], []])
     settled = page()
-    b.observe = lambda screenshot=False: settled
+    b.observe = lambda screenshot=False, frames=True: settled
     monkeypatch.setattr(browser_module, "SETTLE_PAINT", 0.02)
     assert b.still_screen(False, time.monotonic() + 2) is settled
     assert "Page.screencastFrameAck" in calls
@@ -547,14 +548,14 @@ def test_a_screen_that_stops_painting_settles_the_page(monkeypatch):
 
 def test_a_screen_that_never_reports_is_left_to_the_document(monkeypatch):
     b, _ = watched_browser(monkeypatch, [], started=False)
-    b.observe = lambda screenshot=False: page()
+    b.observe = lambda screenshot=False, frames=True: page()
     assert b.still_screen(False, time.monotonic() + 2) is None
     assert b.watching_paint() is False
 
 
 def test_a_screen_that_never_paints_is_asked_once_and_then_left_alone(monkeypatch):
     b, _ = watched_browser(monkeypatch, [])
-    b.observe = lambda screenshot=False: page()
+    b.observe = lambda screenshot=False, frames=True: page()
     began = time.monotonic()
     assert b.still_screen(False, began + 5) is None
     # Given up on quickly whatever the watching budget is, and not retried on the next wait.
@@ -565,7 +566,7 @@ def test_a_screen_that_never_paints_is_asked_once_and_then_left_alone(monkeypatc
 def test_a_screen_that_never_stops_painting_is_left_to_the_document(monkeypatch):
     b, _ = watched_browser(monkeypatch, [])
     monkeypatch.setattr(browser_module, "drain_events", frame)
-    b.observe = lambda screenshot=False: page()
+    b.observe = lambda screenshot=False, frames=True: page()
     monkeypatch.setattr(browser_module, "SETTLE_WATCH", 0.2)
     began = time.monotonic()
     assert b.still_screen(False, began + 5) is None
@@ -575,7 +576,7 @@ def test_a_screen_that_never_stops_painting_is_left_to_the_document(monkeypatch)
 def test_only_a_frame_counts_as_the_screen_having_painted(monkeypatch):
     other = {"method": "Network.responseReceived", "params": {}}
     b, calls = watched_browser(monkeypatch, [[other], [other] + frame()])
-    b.observe = lambda screenshot=False: page()
+    b.observe = lambda screenshot=False, frames=True: page()
     # A drain that found no frame leaves the page never having painted, and acks nothing.
     assert b.painted() is None
     assert calls == []
@@ -703,9 +704,10 @@ def test_a_replay_resolves_each_step_against_the_page_in_front_of_it():
     )
     document = replay_module.script(recorded_state())
     document["steps"] = [{"kind": "fill", "label": "Search", "text": "Ada"}, {"kind": "click", "label": "Go"}]
-    done = replay_module.replay(document, browser=browser)
+    result = replay_module.replay(document, browser=browser)
     assert acted == [("e1", "Ada"), ("e3", None)]
-    assert [step["step"] for step in done] == [1, 2]
+    assert result["status"] == "done" and result["completed"] == 2
+    assert [step["step"] for step in result["steps"]] == [1, 2]
     browser.close.assert_not_called()  # a borrowed browser is left open
 
 
@@ -740,3 +742,391 @@ def test_a_script_round_trips_through_a_file(tmp_path):
     path = tmp_path / "script.json"
     replay_module.write(recorded_state(), path, name="demo")
     assert replay_module.read(path)["steps"][0]["text"] == "Ada"
+
+
+def reported_state():
+    state = recorded_state()
+    state["plan"] = ["Open the contact page", "Find the message field"]
+    state["status"] = "blocked"
+    state["page"] = {**page(), "title": "Contact us", "scroll": {"y": 1120, "height": 6097}}
+    state["decisions"] = [{
+        "operation_probabilities": {"CLICK": 0.31, "BLOCKED": 0.53, "SCROLL_DOWN": 0.12},
+        # A decision also carries the request it sent, which holds the page text.
+        "request": {"state": {"page": {"text": "x" * 6000}}},
+    }]
+    for step in state["history"]:
+        step["page_changed"] = True
+        step["scroll"] = {"y": 560, "height": 6097}
+    return state
+
+
+def test_a_report_carries_positions_and_no_page_content():
+    document = replay_module.report(reported_state())
+    assert document["status"] == "blocked"
+    assert document["goals"] == ["Open the contact page", "Find the message field"]
+    assert document["steps"][0]["y"] == 560 and document["steps"][0]["height"] == 6097
+    assert document["final"]["y"] == 1120 and document["final"]["height"] == 6097
+    assert document["operations"]["BLOCKED"] == 0.53
+    # The page's own text reaches the model but must never reach a report.
+    assert "x" * 100 not in json.dumps(document)
+    assert "e1" not in json.dumps(document) and "fingerprint" not in json.dumps(document)
+
+
+def test_a_report_carries_a_url_only_when_it_changes():
+    state = reported_state()
+    long_url = "https://example.test/search?tfs=" + "A" * 200
+    state["history"][1]["url"] = long_url
+    document = replay_module.report(state)
+    # The first step happened where the run started, so it says nothing about the url.
+    assert "url" not in document["steps"][0]
+    assert document["steps"][1]["url"].startswith("https://example.test/search?tfs=A")
+    assert len(document["steps"][1]["url"]) <= replay_module.URL_LENGTH
+
+
+def test_a_report_is_bounded_by_its_caps_not_by_the_page():
+    state = reported_state()
+    state["history"] = [
+        {"action": f"Some control number {n} with a rather long label", "kind": "click",
+         "text": None, "url": "https://example.test/a/fairly/long/path?with=query", "page_changed": n % 2 == 0,
+         "scroll": {"y": 560 * n, "height": 6097}}
+        for n in range(10)
+    ]
+    state["page"]["actions"] = [
+        {"label": f"Control {n} with a long label that should be cut", "kind": "click"} for n in range(80)
+    ]
+    document = replay_module.report(state)
+    assert len(document["final"]["controls"]) == 25
+    # A real eleven-step Google Flights report is 2,249 bytes, most of it the steps. This is the
+    # same run with every label at its cap and eighty controls offered, so it bounds the shape
+    # rather than describing a typical run.
+    size = len(json.dumps(document, separators=(",", ":")))
+    assert size < 2600, f"a ten-step report should stay bounded, got {size}"
+    # Ten times the page, same report: nothing here scales with what the page contains.
+    state["page"]["actions"] = state["page"]["actions"] * 10
+    state["page"]["text"] = "x" * 60000
+    assert len(json.dumps(replay_module.report(state), separators=(",", ":"))) == size
+
+
+def borrowed_agent(monkeypatch, url, browser):
+    monkeypatch.setattr(loop, "Browser", Mock(side_effect=AssertionError("must not open its own browser")))
+    return loop.Agent(url, "Do the thing", browser=browser)
+
+
+def test_an_agent_can_run_in_a_browser_it_was_given(monkeypatch):
+    browser = Mock(settle=Mock(return_value=page()))
+    runner = borrowed_agent(monkeypatch, None, browser)
+    assert runner.browser is browser
+    # No url, so it starts wherever the browser already is.
+    browser.navigate.assert_not_called()
+
+
+def test_a_borrowed_browser_outlives_the_agent(monkeypatch):
+    browser = Mock(settle=Mock(return_value=page()))
+    borrowed_agent(monkeypatch, None, browser).close()
+    browser.close.assert_not_called()
+
+
+def test_a_url_with_a_borrowed_browser_navigates_it(monkeypatch):
+    browser = Mock(settle=Mock(return_value=page()))
+    borrowed_agent(monkeypatch, "https://example.test/next", browser)
+    browser.navigate.assert_called_once_with("https://example.test/next")
+
+
+def tall_page(y=1120, height=6097, view=780, scrolled=True):
+    state = page()
+    state["scroll"] = {"y": y, "height": height, "view": view}
+    if scrolled:
+        state["actions"] = state["actions"] + [
+            {"id": "scroll_down", "kind": "scroll", "label": "Scroll down", "delta": 560}
+        ]
+    return state
+
+
+def test_a_page_with_most_of_it_unseen_still_has_somewhere_to_go():
+    assert round(model.unseen(tall_page()), 2) == 0.69
+    assert model.scrolling_still_helps(tall_page(), []) is True
+
+
+def test_a_page_read_to_the_bottom_has_nowhere_left():
+    assert model.unseen(tall_page(y=5317)) == 0.0
+    # No way down is offered once the bottom is reached, which is what ends the scrolling.
+    assert model.scrolling_still_helps(tall_page(y=5317, scrolled=False), []) is False
+
+
+def test_a_page_that_grows_as_it_is_read_is_still_worth_scrolling():
+    # Every scroll loads more, so the unseen fraction never falls; only a scroll that moves
+    # nothing says the page is finished.
+    grew = [{"kind": "scroll", "action": "Scroll down", "page_changed": True}]
+    assert model.scrolling_still_helps(tall_page(y=4000, height=12000), grew) is True
+
+
+def test_scrolling_up_is_not_evidence_that_the_page_is_finished():
+    upward = [{"kind": "scroll", "action": "Scroll up", "page_changed": False}]
+    assert model.scrolling_still_helps(tall_page(), upward) is True
+
+
+def test_scrolling_that_stopped_moving_the_page_is_not_worth_more():
+    history = [{"kind": "scroll", "action": "Scroll down", "page_changed": False}]
+    assert model.scrolling_still_helps(tall_page(), history) is False
+    moved = [{"kind": "scroll", "action": "Scroll down", "page_changed": True}]
+    assert model.scrolling_still_helps(tall_page(), moved) is True
+
+
+def test_a_page_that_does_not_report_its_size_can_still_be_scrolled():
+    # `unseen` needs the viewport and reports nothing without it, but the scrolling rule does not
+    # depend on size: a way down that has not been shown to fail is reason enough to take it.
+    bare = tall_page()
+    del bare["scroll"]["view"]
+    assert model.unseen(bare) == 0.0
+    assert model.scrolling_still_helps(bare, []) is True
+
+
+def asked_operations(monkeypatch, state, history):
+    """The operation question `choose` would send for this page."""
+    sent = {}
+
+    def post(url, key, body):
+        sent.update(body)
+        offered = body["questions"]["operation"]["criteria"]
+        return {"model": "test", "answers": {
+            # Whatever is on offer; this asks what was offered, not what was picked.
+            "operation": choice(offered, next(iter(offered))),
+            "type_text_target": choice(["1"], "1"),
+            "click_target": choice(["1", "2"], "1"),
+        }}
+
+    monkeypatch.setenv("TYPESAFE_API_KEY", "test")
+    monkeypatch.setattr(model, "post_json", post)
+    model.choose(state, "Find the contact form", history)
+    return sent["questions"]["operation"]
+
+
+def test_blocked_is_withheld_while_the_page_still_has_somewhere_to_go(monkeypatch):
+    operations = asked_operations(monkeypatch, tall_page(), [])
+    assert "BLOCKED" not in operations["criteria"]
+    assert "69% of this page is below the viewport" in operations["instructions"]
+
+
+def test_blocked_returns_once_scrolling_stops_working(monkeypatch):
+    stuck = [{"kind": "scroll", "action": "Scroll down", "page_changed": False}]
+    operations = asked_operations(monkeypatch, tall_page(), stuck)
+    assert "BLOCKED" in operations["criteria"]
+
+
+def test_blocked_stays_available_on_a_page_with_nothing_below(monkeypatch):
+    operations = asked_operations(monkeypatch, tall_page(y=5317, scrolled=False), [])
+    assert "BLOCKED" in operations["criteria"]
+
+
+def test_a_read_only_run_is_offered_no_way_to_write():
+    actions = [
+        {"id": "e1", "kind": "fill", "label": "Search", "node": 1},
+        {"id": "e2", "kind": "select", "label": "Country", "node": 2},
+        {"id": "e3", "kind": "click", "label": "Submit", "node": 3},
+        {"id": "e4", "kind": "click", "label": "Send message", "node": 4},
+        {"id": "e5", "kind": "click", "label": "About us", "node": 5},
+        {"id": "e6", "kind": "scroll", "label": "Scroll down", "delta": 560},
+    ]
+    kept = [a["label"] for a in model.readable_only(actions)]
+    assert kept == ["About us", "Scroll down"]
+
+
+def test_a_submitting_control_is_recognised_by_its_type_as_well_as_its_words():
+    assert model.submits({"kind": "click", "label": "Read more", "type": "submit"}) is True
+    assert model.submits({"kind": "click", "label": "Continue"}) is True
+    assert model.submits({"kind": "click", "label": "Our continuing story"}) is False
+
+
+def test_a_host_outside_the_allowlist_is_refused():
+    runner = loop.Agent.__new__(loop.Agent)
+    runner.allowed_hosts = ("example.test",)
+    assert runner.off_site({"url": "https://example.test/a"}) is False
+    assert runner.off_site({"url": "https://www.example.test/a"}) is False
+    assert runner.off_site({"url": "https://example.test.evil.com/a"}) is True
+    assert runner.off_site({"url": "https://other.test/a"}) is True
+
+
+def test_no_allowlist_allows_everywhere():
+    runner = loop.Agent.__new__(loop.Agent)
+    runner.allowed_hosts = ()
+    assert runner.off_site({"url": "https://anywhere.test/"}) is False
+
+
+def test_faults_are_deduplicated_and_capped():
+    browser = browser_module.Browser.__new__(browser_module.Browser)
+    browser.faults = {}
+    for _ in range(3):
+        browser.note_fault({"method": "Log.entryAdded",
+                            "params": {"entry": {"level": "error", "text": "same", "url": "u"}}})
+    for n in range(40):
+        browser.note_fault({"method": "Network.responseReceived",
+                            "params": {"response": {"status": 404, "url": f"https://x.test/{n}"}}})
+    browser.note_fault({"method": "Network.responseReceived",
+                        "params": {"type": "Document", "response": {"status": 503, "url": "https://x.test/"}}})
+    browser.note_fault({"method": "Log.entryAdded", "params": {"entry": {"level": "info", "text": "quiet"}}})
+    found = browser_module.diagnosis(browser.faults)
+    assert len(found["console"]) == 1
+    assert len(found["requests"]) == browser_module.FAULTS_KEPT
+    assert found["document_status"] == 503
+
+
+def test_a_run_that_reaches_its_budget_says_so_rather_than_raising(runner):
+    runner.max_steps = 1
+    runner.state["history"] = [{"step": 1, "action": "Go", "kind": "click", "page_changed": True}]
+    got = runner.command("act", {"fingerprint": runner.state["page"]["fingerprint"]})
+    assert got["status"] == "budget"
+    # The action that would have gone over the budget was not taken.
+    assert len(got["history"]) == 1
+
+
+def test_a_local_connection_keeps_the_screen_and_the_longer_wait(monkeypatch):
+    monkeypatch.delenv("BU_CDP_WS", raising=False)
+    reloaded = importlib.reload(browser_module)
+    try:
+        assert reloaded.REMOTE is False
+        assert reloaded.SETTLE_TIMEOUT == 6
+    finally:
+        importlib.reload(browser_module)
+
+
+def test_a_remote_connection_waits_in_the_page_and_does_not_screencast(monkeypatch):
+    monkeypatch.setenv("BU_CDP_WS", "wss://example.test/devtools/browser")
+    reloaded = importlib.reload(browser_module)
+    try:
+        assert reloaded.REMOTE is True
+        # Bounded harder, because each look is a round trip rather than a pipe.
+        assert reloaded.SETTLE_TIMEOUT == 1.5
+        b = reloaded.Browser.__new__(reloaded.Browser)
+        assert b.watching_paint() is False
+    finally:
+        importlib.reload(browser_module)
+
+
+def test_a_reading_script_is_taken_again_after_the_connection_goes(monkeypatch):
+    document = {"version": replay_module.VERSION, "url": "https://example.test/",
+                "steps": [{"kind": "click", "label": "Go"}]}
+    assert replay_module.mutates(document) is False
+    attempts = []
+
+    def run_once(doc, browser, screenshots, on_step, done):
+        attempts.append(1)
+        if len(attempts) == 1:
+            raise RuntimeError("WebSocket connection closed")
+        done.append({"step": 1})
+
+    monkeypatch.setattr(replay_module, "run_once", run_once)
+    result = replay_module.replay(document)
+    assert result["status"] == "done" and len(attempts) == 2
+
+
+def test_a_script_that_types_is_not_taken_again_and_says_where_it_stopped(monkeypatch):
+    document = {"version": replay_module.VERSION, "url": "https://example.test/",
+                "steps": [{"kind": "click", "label": "Open"}, {"kind": "fill", "label": "Search", "text": "Ada"}]}
+    assert replay_module.mutates(document) is True
+    attempts = []
+
+    def run_once(doc, browser, screenshots, on_step, done):
+        attempts.append(1)
+        done.append({"step": 1})  # the first step went through before the connection went
+        raise RuntimeError("WebSocket connection closed")
+
+    monkeypatch.setattr(replay_module, "run_once", run_once)
+    result = replay_module.replay(document)
+    # Taken once only: repeating it would type into the page a second time.
+    assert len(attempts) == 1
+    assert result["status"] == "connection_lost"
+    assert result["completed"] == 1 and result["repeatable"] is False
+
+
+def test_a_submitting_click_makes_a_script_unrepeatable():
+    document = {"version": replay_module.VERSION, "url": "https://example.test/",
+                "steps": [{"kind": "click", "label": "Send message"}]}
+    assert replay_module.mutates(document) is True
+
+
+def test_a_query_reports_a_value_or_what_it_raised(monkeypatch):
+    b = browser_module.Browser.__new__(browser_module.Browser)
+    b.session = "test"
+    answers = iter([
+        {"result": {"value": "ok"}},
+        {"exceptionDetails": {"exception": {"description": "ReferenceError: nope is not defined"}}},
+        {"result": {"value": {"a": 1}}},
+    ])
+    monkeypatch.setattr(browser_module, "cdp", lambda *a, **kw: next(answers))
+    assert b.ask("'ok'") == {"value": "ok"}
+    assert b.ask("nope")["exception"].startswith("ReferenceError")
+    assert b.ask("({a:1})") == {"value": {"a": 1}}
+
+
+def test_a_long_answer_is_cut_to_the_cap(monkeypatch):
+    b = browser_module.Browser.__new__(browser_module.Browser)
+    b.session = "test"
+    monkeypatch.setattr(browser_module, "cdp", lambda *a, **kw: {"result": {"value": "x" * 9000}})
+    assert len(b.ask("big", cap=2048)["value"]) == 2048
+
+
+def test_a_question_waits_for_the_goals_named_before_it():
+    runner = loop.Agent.__new__(loop.Agent)
+    runner.asked = [{"query": "first", "after": 1}, {"query": "last", "after": 2}]
+    runner.answered, runner.plan_satisfied = {}, {0}
+    asked = []
+    state = {"plan": ["a", "b"], "status": "ready",
+             "browser": Mock(ask=Mock(side_effect=lambda q: asked.append(q) or {"value": q}))}
+    runner.ask_due(state)
+    assert asked == ["first"]  # the second waits for the goal it follows
+    state["status"] = "done"
+    runner.ask_due(state)
+    assert asked == ["first", "last"]
+    assert state["queries"] == [{"value": "first"}, {"value": "last"}]
+
+
+def held_browser(target="T1", context="C1"):
+    browser = Mock()
+    browser.target, browser.context = target, context
+    return browser
+
+
+def test_a_handle_carries_everything_needed_to_close_the_page(monkeypatch):
+    monkeypatch.setattr(session_module, "_send", lambda req: {"browser_session_id": "a-uuid-from-the-handshake"})
+    handle = session_module.handle_for(held_browser(), worker="worker-3")
+    assert handle["worker_id"] == "worker-3"
+    assert handle["target_id"] == "T1" and handle["context_id"] == "C1"
+    assert handle["browser_session_id"] == "a-uuid-from-the-handshake"
+    assert handle["id"] and handle["id"] != session_module.handle_for(held_browser())["id"]
+
+
+def test_a_harness_that_does_not_keep_the_session_reports_none(monkeypatch):
+    def refuses(req):
+        raise RuntimeError("unknown meta")
+
+    monkeypatch.setattr(session_module, "_send", refuses)
+    assert session_module.browser_session_id() is None
+
+
+def test_a_handle_closes_the_target_and_the_context_around_it(monkeypatch):
+    sent = []
+    monkeypatch.setattr(session_module, "cdp", lambda method, **kw: sent.append((method, kw)) or {})
+    assert session_module.close_handle({"target_id": "T1", "context_id": "C1"}) == {
+        "target": True, "context": True}
+    assert [method for method, _ in sent] == ["Target.closeTarget", "Target.disposeBrowserContext"]
+
+
+def test_closing_a_page_that_is_already_gone_is_not_an_error(monkeypatch):
+    def gone(method, **kw):
+        raise RuntimeError("No target with given id found")
+
+    monkeypatch.setattr(session_module, "cdp", gone)
+    # A registry sweeping orphans cannot know which the worker closed on its way out.
+    assert session_module.close_handle({"target_id": "T1", "context_id": "C1"}) == {
+        "target": False, "context": False}
+
+
+
+def test_freeing_a_worker_closes_its_page_and_gives_back_the_daemon(monkeypatch):
+    monkeypatch.setattr(session_module, "cdp", lambda method, **kw: {})
+    runner = loop.Agent.__new__(loop.Agent)
+    runner.borrowed, runner.browser = False, Mock()
+    runner.handle = {"target_id": "T1", "context_id": "C1"}
+    assert runner.free() == {"target": True, "context": True}
+    assert runner.handle is None
+    runner.browser.release.assert_called_once()

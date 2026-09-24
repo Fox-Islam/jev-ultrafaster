@@ -17,6 +17,22 @@ import browser_harness
 
 EDITS = (
     (
+        '        await self.attach_first_page()',
+        '        # Browser Run names the browser it gave us in the handshake response, and nothing\n'
+        '        # inside CDP reports it. Read once, here, because the response is gone afterwards.\n'
+        '        try:\n'
+        '            self.browser_session = dict(self.cdp.ws.response.headers).get("cf-browser-session-id")\n'
+        '        except Exception:\n'
+        '            self.browser_session = None\n'
+        '        await self.attach_first_page()',
+    ),
+    (
+        '        if meta == "session":     return {"session_id": self.session}',
+        '        if meta == "session":     return {"session_id": self.session}\n'
+        '        if meta == "browser_session":\n'
+        '            return {"browser_session_id": getattr(self, "browser_session", None)}',
+    ),
+    (
         '        self.cdp = _PatientCDPClient(url) if BROWSER_KIND == "local" else CDPClient(url)',
         '        self.cdp = (\n'
         '            _PatientCDPClient(url)\n'
@@ -62,15 +78,23 @@ EDITS = (
 def main():
     daemon = pathlib.Path(browser_harness.__file__).with_name("daemon.py")
     source = daemon.read_text()
-    if "def cdp_headers()" in source:
+    if "def cdp_headers()" in source and "browser_session" in source:
         print(f"already patched: {daemon}")
         return 0
+    if "def cdp_headers()" in source:
+        print(f"cannot patch {daemon}: partly patched already; reinstall browser-harness first")
+        return 1
     for old, new in EDITS:
         if source.count(old) != 1:
             print(f"cannot patch {daemon}: expected exactly one of {old[:60]!r}, found {source.count(old)}")
             return 1
         source = source.replace(old, new)
-    daemon.write_text(source)
+    # Written as a new file and moved into place, never edited where it lies: uv hardlinks
+    # installed files from its global cache, so writing in place edits the cache too and the
+    # patch escapes into every other environment that installs this version.
+    spare = daemon.with_suffix(".patched")
+    spare.write_text(source)
+    spare.replace(daemon)
     print(f"patched {daemon}")
     print('set BU_CDP_HEADERS to a JSON object, e.g. ' + json.dumps({"Authorization": "Bearer <token>"}))
     return 0

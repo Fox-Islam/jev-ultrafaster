@@ -74,6 +74,33 @@ def validate_choice(answer, ids):
     return answer
 
 
+# What a control has to look like to be treated as submitting. A read-only run may click to
+# navigate or reveal, but must not post anything, and the page does not label that for us.
+SUBMITS = ("submit", "send", "search", "sign in", "log in", "register", "subscribe", "donate",
+           "buy", "pay", "checkout", "order", "book", "apply", "continue", "next", "confirm",
+           "save", "delete", "remove", "post", "comment", "upload")
+
+
+def submits(action):
+    """Whether clicking this is likely to send something rather than move around."""
+    if action.get("type") == "submit" or action.get("role") == "button" and action.get("form"):
+        return True
+    label = " ".join(str(action.get("label") or "").lower().split())
+    return any(word == label or label.startswith(word + " ") or label.endswith(" " + word) for word in SUBMITS)
+
+
+def readable_only(actions):
+    """The actions a read-only run may take.
+
+    Withheld in the action space rather than asked for in the prompt: an operation that is never
+    offered cannot be chosen, however the goal is worded.
+    """
+    return [
+        action for action in actions
+        if action["kind"] not in {"fill", "select"} and not (action["kind"] == "click" and submits(action))
+    ]
+
+
 def action_space(actions):
     """One index per observed element; each operation has its own valid target choices."""
     elements, indices, targets, controls = [], {}, {}, {}
@@ -170,6 +197,33 @@ def read_plan_answers(answers, pending, operations, targets, settled):
     return read
 
 
+def unseen(state):
+    """How much of the page lies below the viewport, as a fraction of its height.
+
+    Zero when the reader could not say, so a page that does not report its size is never treated
+    as having more to show.
+    """
+    scroll = state.get("scroll") or {}
+    height, y, view = scroll.get("height"), scroll.get("y"), scroll.get("view")
+    if not height or y is None or view is None:
+        return 0.0
+    return max(0, height - (y + view)) / height
+
+
+def scrolling_still_helps(state, history):
+    """Whether going further down the page is worth more than giving up on it.
+
+    A long page hides its content rather than lacking it, so a run answering BLOCKED from the top
+    has established nothing about it. What ends that is evidence, not arithmetic: a scroll down
+    that moved nothing. How much is left cannot be that evidence, because a page that loads as it
+    is scrolled grows as fast as it is read, and its remaining fraction never falls.
+    """
+    if not any(a["kind"] == "scroll" and a.get("delta", 0) > 0 for a in state["actions"]):
+        return False
+    down = [step for step in history if step.get("kind") == "scroll" and "down" in str(step.get("action", "")).lower()]
+    return not down or down[-1].get("page_changed") is not False
+
+
 def choose(state, goal, history, pending=(), suppress=()):
     elements, targets, controls = action_space(state["actions"])
     # A control that has been chosen repeatedly without moving the page is not going to move it
@@ -190,8 +244,14 @@ def choose(state, goal, history, pending=(), suppress=()):
     operations = {key: labels[key] for key in targets}
     operations.update({key: value["label"] for key, value in controls.items()})
     operations.update(DONE="Every requirement is visibly satisfied.", BLOCKED="No supported operation can progress.")
+    rules = [NEXT_ACTION]
+    if scrolling_still_helps(state, history):
+        # Withheld rather than argued against, the way a control that stopped moving the page is:
+        # an option that is not offered cannot be taken, and the next-best answer is forced.
+        operations.pop("BLOCKED", None)
+        rules.append(f"{round(unseen(state) * 100)}% of this page is below the viewport and has not been seen.")
     questions = {
-        "operation": {"type": "choice", "criteria": operations, "instructions": flatten_instructions(goal, NEXT_ACTION)}
+        "operation": {"type": "choice", "criteria": operations, "instructions": flatten_instructions(goal, rules)}
     }
     # A head offering one candidate is not a choice: it answers 1.00 whatever the element is, which
     # reads as certainty to anything downstream weighing confidence.
