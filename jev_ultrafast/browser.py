@@ -139,28 +139,36 @@ class Browser:
     def worth_reading_frames(self, page):
         """Whether to spend calls looking inside this page's frames.
 
-        Reading them costs a listing plus two measurements and a read for each frame, every
-        observation - about a third more protocol calls on a page full of advertising slots, for
-        nothing, because its own controls were all readable anyway. A page that offers nothing is
-        the one that needs it: the content may be in a frame, as it is on a review surface where
-        the site under review is proxied into one, and the alternative is answering BLOCKED.
+        Reading them costs a listing, two measurements and a read per frame on every observation -
+        about a third more protocol calls on a page whose own controls were all readable anyway.
+        JEV_FRAMES says where that is worth paying: "1" for every page, or a comma-separated list of
+        strings matched against the address, so a surface that proxies its content into a frame can
+        be named without slowing everything else down.
+
+        A page offering nothing is read whatever the setting says. That case cannot be foreseen from
+        a list, and the alternative is an empty action space, which can only be answered BLOCKED.
         """
-        return os.environ.get("JEV_FRAMES") == "1" or not operable(page)
+        setting = os.environ.get("JEV_FRAMES", "").strip()
+        if setting == "1":
+            return True
+        wanted = [part.strip() for part in setting.split(",") if part.strip()]
+        if wanted and any(part in (page.get("url") or "") for part in wanted):
+            return True
+        return not operable(page)
 
     def read(self, screenshot):
-        """One observation of the page and of every cross-origin frame in it, as a single state.
+        """One observation of the page, and of its frames when those are worth reading.
 
-        Ids, guards and page keys are namespaced by frame, because each frame numbers its own nodes
-        from one and a decision has to say which frame it is about. Each action carries the session
-        that owns it and where its frame sits, so it can be validated and executed later.
+        Ids, guards and page keys are namespaced by frame whether or not any frame is read, because
+        every frame numbers its own nodes from one and a decision has to say which frame it means.
+        Numbering only when a frame happens to be present would make the same element answer to two
+        different names depending on the page, and a guard looked up under the wrong one reads as a
+        page that has moved.
         """
-        page = browser_operation({"operation": "observe", "session": self.session, "screenshot": screenshot})
-        if not self.worth_reading_frames(page):
-            return page
         merged = None
-        for index, frame in enumerate(self.frames()):
-            state = browser_operation(
-                {"operation": "observe", "session": frame["session"], "screenshot": screenshot and index == 0}
+        for index, frame in enumerate(self.frames_to_read(screenshot)):
+            state = frame.pop("state", None) or browser_operation(
+                {"operation": "observe", "session": frame["session"], "screenshot": False}
             )
             for action in state["actions"]:
                 action["frame"] = index
@@ -179,6 +187,15 @@ class Browser:
             merged["page_keys"][str(index)] = state.get("page_key")
         merged["fingerprint"] = fingerprint(merged)
         return merged
+
+    def frames_to_read(self, screenshot):
+        """The page, plus its frames when they are worth the calls. The page's own observation is
+        carried along so it is never taken twice."""
+        page = browser_operation({"operation": "observe", "session": self.session, "screenshot": screenshot})
+        first = {"session": self.session, "offset": (0.0, 0.0), "state": page}
+        if not self.worth_reading_frames(page):
+            return [first]
+        return [first] + self.frames()[1:]
 
     def fresh(self, page, action=None):
         if action is not None and action["kind"] in {"click", "select"}:
