@@ -154,7 +154,13 @@ class Agent:
             if action["kind"] == "fill":
                 if not state["browser"].fresh(page):
                     raise StalePage("Page changed before text generation. Choose again.")
-                context = field_context(state["goal"], action, page, state["history"])
+                # A held decision was taken for one sub-goal, so that is what the field is for.
+                # Handing over the whole task instead invites a value inferred from the wrong part
+                # of it: asked to fill an email field under a five-line goal, with "Ada" and
+                # "Lovelace" just typed, the helper answered "Ada Lovelace".
+                held_for = decision.get("reused_for")
+                wanted = state["plan"][held_for] if held_for is not None else state["goal"]
+                context = field_context(wanted, action, page, state["history"])
                 if self.pending_text and self.pending_text[0] == context:
                     _, text, helper = self.pending_text
                 else:

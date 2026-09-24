@@ -467,3 +467,14 @@ def test_the_rejected_content_is_named_in_the_error(monkeypatch):
     monkeypatch.setattr(model, "post_json", Mock(return_value={"choices": [{"message": {"content": "I cannot"}}]}))
     with pytest.raises(ValueError, match="I cannot"):
         model.field_text({"goal": "x"})
+
+
+def test_a_reused_fill_is_told_which_sub_goal_it_is_for(runner, monkeypatch):
+    helper = Mock(return_value=("Zurich", {"model": "test", "latency_ms": 1}))
+    monkeypatch.setattr(loop, "field_text", helper)
+    runner.state["plan"] = ["Set the origin", "Set the destination"]
+    runner.state["goal"] = "Set the origin\nSet the destination"
+    runner.state["decision"] = {**decision(), "reused_for": 1}
+    runner.command("act", {"fingerprint": runner.state["page"]["fingerprint"]})
+    # The helper must see the sub-goal the held decision was taken for, not the whole task.
+    assert helper.call_args.args[0]["goal"] == "Set the destination"
