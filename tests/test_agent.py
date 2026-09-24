@@ -478,3 +478,37 @@ def test_a_reused_fill_is_told_which_sub_goal_it_is_for(runner, monkeypatch):
     runner.command("act", {"fingerprint": runner.state["page"]["fingerprint"]})
     # The helper must see the sub-goal the held decision was taken for, not the whole task.
     assert helper.call_args.args[0]["goal"] == "Set the destination"
+
+
+def test_field_values_asks_once_for_several_fields(monkeypatch):
+    monkeypatch.setenv("TEXT_MODEL_API_KEY", "test")
+    post = Mock(return_value={"choices": [{"message": {"content": '{"a":"Ada","b":"Lovelace"}'}}]})
+    monkeypatch.setattr(model, "post_json", post)
+    fields = {
+        "a": ("Set the first name to Ada", {"label": "First Name", "role": "textbox", "value": ""}),
+        "b": ("Set the last name to Lovelace", {"label": "Last Name", "role": "textbox", "value": ""}),
+    }
+    values, helper = model.field_values(fields, page(), [])
+    assert values == {"a": "Ada", "b": "Lovelace"}
+    assert post.call_count == 1  # one call, not one per field
+    assert helper["fields"] == 2
+
+
+@pytest.mark.parametrize(
+    "content,kept",
+    [
+        ('{"a":"Ada","b":null}', {"a": "Ada"}),
+        ('{"a":"Ada","b":"  "}', {"a": "Ada"}),
+        ('{"a":"Ada","unasked":"x"}', {"a": "Ada"}),
+        ("not json at all", {}),
+    ],
+)
+def test_a_value_that_does_not_hold_up_is_left_out(monkeypatch, content, kept):
+    monkeypatch.setenv("TEXT_MODEL_API_KEY", "test")
+    monkeypatch.setattr(model, "post_json", Mock(return_value={"choices": [{"message": {"content": content}}]}))
+    fields = {
+        "a": ("goal a", {"label": "A", "role": "textbox", "value": ""}),
+        "b": ("goal b", {"label": "B", "role": "textbox", "value": ""}),
+    }
+    # A field left out here falls back to its own call rather than being filled with a guess.
+    assert model.field_values(fields, page(), [])[0] == kept

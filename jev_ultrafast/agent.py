@@ -5,7 +5,7 @@ import time
 from pathlib import Path
 
 from .browser import Browser, StalePage
-from .model import action_space, choose, field_context, field_text
+from .model import action_space, choose, field_context, field_text, field_values
 from .questions import FIXATION_REPEATS, FIXATION_WINDOW, MAX_STEPS, PLAN_SATISFIED, TEXT_ATTEMPTS
 
 
@@ -23,6 +23,7 @@ class Agent:
         self.plan_satisfied = set()
         # Decisions taken for later sub-goals, kept until they apply or are overwritten.
         self.held = {}
+        self.ready_values = {}
         self.reuse_held_answers = reuse_held
         self.reused = 0
         self.pending_text = None
@@ -117,6 +118,8 @@ class Agent:
                 for index, entry in zip(outstanding, state["decision"].get("plan") or [])
                 if entry.get("label") and index not in self.plan_satisfied
             }
+            # After the holds are known, because what they name is what needs a value.
+            self.fetch_values(state)
             state["decisions"].append(
                 {
                     **state["decision"],
@@ -161,7 +164,10 @@ class Agent:
                 held_for = decision.get("reused_for")
                 wanted = state["plan"][held_for] if held_for is not None else state["goal"]
                 context = field_context(wanted, action, page, state["history"])
-                if self.pending_text and self.pending_text[0] == context:
+                ready = getattr(self, "ready_values", {}).pop(action["label"], None)
+                if ready is not None:
+                    text, helper = ready, None
+                elif self.pending_text and self.pending_text[0] == context:
                     _, text, helper = self.pending_text
                 else:
                     try:
@@ -238,6 +244,37 @@ class Agent:
                 key = (step["action"], step["kind"])
                 seen[key] = seen.get(key, 0) + 1
         return {key for key, count in seen.items() if count >= FIXATION_REPEATS}
+
+    def fetch_values(self, state):
+        """Ask for every field value this step will need, in one call rather than one each.
+
+        The decisions just taken say which sub-goals are fills and which control each means, so the
+        values can be had together. Asked one at a time they are serial and each costs about 600ms,
+        which is what made a form cost more per field while its decisions stayed at one call.
+        """
+        self.ready_values = {}
+        wanted, page = {}, state["page"]
+        decision = state["decision"] or {}
+        if decision.get("operation") == "TYPE_TEXT":
+            acting = next((a for a in page["actions"] if a["id"] == decision.get("choice")), None)
+            if acting is not None and acting["kind"] == "fill" and not acting.get("value"):
+                wanted[acting["label"]] = (state["goal"], acting)
+        for index, entry in self.held.items():
+            if entry.get("operation") != "TYPE_TEXT" or not entry.get("label"):
+                continue
+            matches = [a for a in page["actions"] if a["label"] == entry["label"] and a["kind"] == "fill"]
+            if len(matches) != 1 or matches[0].get("value") or matches[0]["label"] in wanted:
+                continue
+            wanted[matches[0]["label"]] = (state["plan"][index], matches[0])
+        if len(wanted) < 2:
+            return  # one field is one call either way
+        try:
+            values, helper = field_values(wanted, page, state["history"])
+        except (ValueError, RuntimeError):
+            return  # each field falls back to its own call
+        if helper:
+            state["text_calls"].append({**helper, "field": f"{len(values)} fields", "value": None})
+        self.ready_values = values
 
     def reuse_held(self, outstanding):
         """A decision held for a sub-goal, re-resolved against the page as it is now.

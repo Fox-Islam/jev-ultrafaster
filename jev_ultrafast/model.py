@@ -7,7 +7,7 @@ import time
 
 import httpx
 
-from .questions import NEXT_ACTION, TARGET, TEXT_VALUE
+from .questions import NEXT_ACTION, TARGET, TEXT_VALUE, TEXT_VALUES
 
 CLIENT = httpx.Client(http2=True, timeout=25)
 
@@ -251,6 +251,64 @@ def choose(state, goal, history, pending=(), suppress=()):
         "usage": result.get("usage", {}),
         "latency_ms": round((time.perf_counter() - started) * 1000),
         "request": body,
+    }
+
+
+def field_values(contexts, page, history):
+    """Every field value a step needs, in one call.
+
+    Asked one at a time these are strictly serial, and each costs about 600ms, so a form's cost
+    grew by that much per field while the decisions behind them stayed at one call however many
+    there were. They do not depend on each other: each is a sub-goal and a field. Asked together
+    they cost one call once.
+    """
+    key = os.environ.get("TEXT_MODEL_API_KEY")
+    if not key:
+        raise ValueError("TYPE_TEXT needs TEXT_MODEL_API_KEY; no text is hardcoded or guessed by the executor.")
+    base = os.environ.get("TEXT_MODEL_BASE_URL", "https://api.deepseek.com/v1").rstrip("/")
+    model = os.environ.get("TEXT_MODEL", "deepseek-chat")
+    reasoning = {"thinking": {"type": "disabled"}} if "api.deepseek.com/" in base else {"reasoning": {"effort": "low"}}
+    if os.environ.get("TEXT_MODEL_REASONING") == "none":
+        reasoning = {"reasoning": {"enabled": False}}
+    payload = {
+        "fields": {
+            field_id: {"goal": goal, "field": {k: action.get(k) for k in ("label", "role", "value")}}
+            for field_id, (goal, action) in contexts.items()
+        },
+        "page": {"title": page["title"], "text": (page.get("text") or "")[:6000]},
+        "recent_actions": [{k: h.get(k) for k in ("action", "text")} for h in history[-6:]],
+    }
+    started = time.perf_counter()
+    result = post_json(
+        base + "/chat/completions",
+        key,
+        {
+            "model": model,
+            "max_tokens": 4096,
+            "response_format": {"type": "json_object"},
+            **reasoning,
+            "messages": [
+                {"role": "system", "content": TEXT_VALUES},
+                {"role": "user", "content": json.dumps(payload)},
+            ],
+        },
+    )
+    content = (result.get("choices") or [{}])[0].get("message", {}).get("content")
+    try:
+        output = field_value(content)
+    except (ValueError, TypeError):
+        return {}, None
+    # A value that does not hold up is left out, not substituted: the field then gets its own call.
+    values = {
+        field_id: value
+        for field_id, value in (output or {}).items()
+        if field_id in contexts and isinstance(value, str) and value.strip() and len(value) <= 2000
+    }
+    return values, {
+        "model": model,
+        "latency_ms": round((time.perf_counter() - started) * 1000),
+        "usage": result.get("usage", {}),
+        "fields": len(values),
     }
 
 
