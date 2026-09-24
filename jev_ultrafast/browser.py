@@ -41,8 +41,44 @@ class Browser:
     def call(self, method, **params):
         return cdp(method, session_id=self.session, **params)
 
-    def evaluate(self, expression):
-        response = self.call("Runtime.evaluate", expression=expression, returnByValue=True)
+    def frames(self):
+        """The page's own session, plus one per cross-origin iframe, with each frame's offset.
+
+        A cross-origin iframe runs out of process, so it is absent from the page's frame tree and
+        unreachable from the page's JavaScript: the reader running in the page sees nothing of it.
+        It is its own CDP target, though, and the same reader works inside it. The offset is where
+        the frame sits on the page, because the Input domain exists only on the page target, so a
+        click worked out inside a frame has to be dispatched in the page's coordinates.
+        """
+        found = [{"session": self.session, "offset": (0.0, 0.0)}]
+        attached = getattr(self, "attached", None)
+        if attached is None:
+            attached = self.attached = {}
+        try:
+            targets = cdp("Target.getTargets")["targetInfos"]
+        except (RuntimeError, KeyError):
+            return found
+        for info in targets:
+            if info.get("type") != "iframe" or info.get("url", "").startswith("about:"):
+                continue
+            try:
+                # Attaching is once per frame, not once per observation: a session outlives the
+                # look that found it, and re-attaching would spend calls to learn what is known.
+                session = attached.get(info["targetId"])
+                if session is None:
+                    session = cdp("Target.attachToTarget", targetId=info["targetId"], flatten=True)["sessionId"]
+                    attached[info["targetId"]] = session
+                owner = self.call("DOM.getFrameOwner", frameId=info["targetId"])
+                box = self.call("DOM.getBoxModel", backendNodeId=owner["backendNodeId"])["model"]["content"]
+            except (RuntimeError, KeyError):
+                continue  # not ours, or gone between listing and attaching
+            found.append({"session": session, "offset": (box[0], box[1])})
+        return found
+
+    def evaluate(self, expression, session=None):
+        response = cdp(
+            "Runtime.evaluate", session_id=session or self.session, expression=expression, returnByValue=True
+        )
         if response.get("exceptionDetails"):
             raise StalePage("Document changed during evaluation")
         return response.get("result", {}).get("value")
@@ -82,25 +118,56 @@ class Browser:
                 pass
         for attempt in range(10):
             try:
-                return browser_operation(
-                    {"operation": "observe", "session": self.session, "screenshot": screenshot}
-                )
+                return self.read(screenshot)
             except StalePage:
                 if attempt == 9:
                     raise
                 time.sleep(0.02)
         raise StalePage("Page did not settle")
 
+    def read(self, screenshot):
+        """One observation of the page and of every cross-origin frame in it, as a single state.
+
+        Ids, guards and page keys are namespaced by frame, because each frame numbers its own nodes
+        from one and a decision has to say which frame it is about. Each action carries the session
+        that owns it and where its frame sits, so it can be validated and executed later.
+        """
+        merged = None
+        for index, frame in enumerate(self.frames()):
+            state = browser_operation(
+                {"operation": "observe", "session": frame["session"], "screenshot": screenshot and index == 0}
+            )
+            for action in state["actions"]:
+                action["frame"] = index
+                action["session"] = frame["session"]
+                action["offset"] = frame["offset"]
+                action["id"] = f"{index}:{action['id']}"
+            guards = {f"{index}:{node}": guard for node, guard in state.get("guards", {}).items()}
+            if merged is None:
+                merged = state
+                merged["guards"] = guards
+                merged["page_keys"] = {str(index): state.get("page_key")}
+                continue
+            merged["actions"].extend(state["actions"])
+            merged["text"] = (merged.get("text") or "") + "\n" + (state.get("text") or "")
+            merged["guards"].update(guards)
+            merged["page_keys"][str(index)] = state.get("page_key")
+        merged["fingerprint"] = fingerprint(merged)
+        return merged
+
     def fresh(self, page, action=None):
         if action is not None and action["kind"] in {"click", "select"}:
             node = action["node"]
             if type(node) is not int:
                 return False
+            frame = action.get("frame", 0)
             current = self.evaluate(
                 "(() => { const c=window.__jevFast; "
-                f"return c ? [c.pageKey(),c.guard(c.nodes.get({node}))] : null; }})()"
+                f"return c ? [c.pageKey(),c.guard(c.nodes.get({node}))] : null; }})()",
+                session=action.get("session"),
             )
-            return current == [page["page_key"], page["guards"].get(str(node))]
+            keys = page.get("page_keys") or {"0": page.get("page_key")}
+            return current == [keys.get(str(frame)), page["guards"].get(f"{frame}:{node}")]
         return self.evaluate(MARKER) == page["marker"]
 
     def settle(self, screenshot=False, timeout=6.0, previous=None, stabilise=False):
@@ -136,7 +203,14 @@ class Browser:
             raise StalePage("Page changed since this decision. Observe again.")
         if action["kind"] == "wait":
             time.sleep(0.1)
-        result = browser_operation({"operation": "act", "session": self.session, "action": action, "text": text})
+        result = browser_operation({
+            "operation": "act",
+            "session": action.get("session", self.session),
+            "dispatch_session": self.session,
+            "offset": action.get("offset", (0.0, 0.0)),
+            "action": action,
+            "text": text,
+        })
         self.after_input = action if action["kind"] != "wait" else None
         return result
 
@@ -192,8 +266,16 @@ def browser_operation(request):
     if operation == "act":
         action = request["action"]
         kind = action["kind"]
+        dispatch = request.get("dispatch_session", session)
+        dx, dy = request.get("offset", (0.0, 0.0))
+
+        def send(method, **params):
+            # The Input domain lives on the page target only: a frame cannot dispatch its own
+            # events, so the page does it, in page coordinates.
+            return cdp(method, session_id=dispatch, **params)
+
         if kind == "scroll":
-            call("Input.dispatchMouseEvent", type="mouseWheel", x=550, y=650, deltaX=0, deltaY=action["delta"])
+            send("Input.dispatchMouseEvent", type="mouseWheel", x=550, y=650, deltaX=0, deltaY=action["delta"])
         elif kind != "wait":
             if type(action["node"]) is not int:
                 raise ValueError("Invalid observed node")
@@ -220,11 +302,11 @@ def browser_operation(request):
                     raise RuntimeError("Dropdown execution was not confirmed; inspect before retrying.")
                 raise StalePage("Target changed or is covered. Observe again.")
             if kind != "select":
-                x, y = target["x"], target["y"]
+                x, y = target["x"] + dx, target["y"] + dy
                 for event in ("mousePressed", "mouseReleased"):
-                    call("Input.dispatchMouseEvent", type=event, x=x, y=y, button="left", clickCount=1)
+                    send("Input.dispatchMouseEvent", type=event, x=x, y=y, button="left", clickCount=1)
                 if kind == "fill":
-                    call(
+                    send(
                         "Input.dispatchKeyEvent",
                         type="keyDown",
                         key="a",
@@ -232,14 +314,14 @@ def browser_operation(request):
                         modifiers=4 if sys.platform == "darwin" else 2,
                         commands=["selectAll"],
                     )
-                    call(
+                    send(
                         "Input.dispatchKeyEvent",
                         type="keyUp",
                         key="a",
                         code="KeyA",
                         modifiers=4 if sys.platform == "darwin" else 2,
                     )
-                    call("Input.insertText", text=request["text"])
+                    send("Input.insertText", text=request["text"])
         return {"executed": action["id"]}
 
     info = evaluate(READ_STATE)
