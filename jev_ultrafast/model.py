@@ -144,7 +144,7 @@ def plan_questions(pending, operations, targets, settled):
 
 def read_plan_answers(answers, pending, operations, targets, settled):
     """Probability that each outstanding sub-goal is already satisfied, or None if unreadable.
-    A malformed reading must not stop the run, so it is dropped rather than raised."""
+    A malformed reading must not stop the run, so it is dropped instead of raised."""
     read = []
     for offset in range(len(pending)):
         value = answers.get(f"plan{offset}_satisfied", {}).get("noul")
@@ -162,7 +162,7 @@ def read_plan_answers(answers, pending, operations, targets, settled):
                         answers.get(f"plan{offset}_{entry['operation'].lower()}_target", {}), group
                     )
                     action = group[target["choice"]]
-                # Held by label and kind, never by node id: an id survives a change of meaning.
+                # Held by label and kind; `Agent.reuse_held` says why never by node id.
                 entry["label"], entry["kind"] = action["label"], action["kind"]
         except (ValueError, KeyError):
             entry["label"] = None
@@ -180,7 +180,7 @@ def choose(state, goal, history, pending=(), suppress=()):
             for operation, candidates in targets.items()
             if (kept := {i: a for i, a in candidates.items() if (a["label"], a["kind"]) not in suppress})
         }
-        if not targets:  # never strand the agent: an empty action space can only answer BLOCKED
+        if not targets:  # never strand the agent with nothing it can choose
             _, targets, _ = action_space(state["actions"])
     labels = {
         "CLICK": "Click an element, button, menu option, autocomplete suggestion, or calendar day.",
@@ -254,13 +254,20 @@ def choose(state, goal, history, pending=(), suppress=()):
     }
 
 
-def field_values(contexts, page, history):
-    """Every field value a step needs, in one call.
+def field_brief(action):
+    return {k: action.get(k) for k in ("label", "role", "value")}
 
-    Asked one at a time these are strictly serial, and each costs about 600ms, so a form's cost
-    grew by that much per field while the decisions behind them stayed at one call however many
-    there were. They do not depend on each other: each is a sub-goal and a field. Asked together
-    they cost one call once.
+
+def recent_actions(history):
+    return [{k: step.get(k) for k in ("action", "text")} for step in history[-6:]]
+
+
+def text_helper(instructions, payload):
+    """One call to the text helper, and the record of what it cost.
+
+    The endpoint, the model and the reasoning switch are read here so the two callers cannot drift
+    apart on any of them. DeepSeek spells the switch differently from everything reached through
+    OpenRouter, and TEXT_MODEL_REASONING=none turns it off for a model that accepts neither.
     """
     key = os.environ.get("TEXT_MODEL_API_KEY")
     if not key:
@@ -270,14 +277,6 @@ def field_values(contexts, page, history):
     reasoning = {"thinking": {"type": "disabled"}} if "api.deepseek.com/" in base else {"reasoning": {"effort": "low"}}
     if os.environ.get("TEXT_MODEL_REASONING") == "none":
         reasoning = {"reasoning": {"enabled": False}}
-    payload = {
-        "fields": {
-            field_id: {"goal": goal, "field": {k: action.get(k) for k in ("label", "role", "value")}}
-            for field_id, (goal, action) in contexts.items()
-        },
-        "page": {"title": page["title"], "text": (page.get("text") or "")[:6000]},
-        "recent_actions": [{k: h.get(k) for k in ("action", "text")} for h in history[-6:]],
-    }
     started = time.perf_counter()
     result = post_json(
         base + "/chat/completions",
@@ -288,12 +287,36 @@ def field_values(contexts, page, history):
             "response_format": {"type": "json_object"},
             **reasoning,
             "messages": [
-                {"role": "system", "content": TEXT_VALUES},
+                {"role": "system", "content": instructions},
                 {"role": "user", "content": json.dumps(payload)},
             ],
         },
     )
     content = (result.get("choices") or [{}])[0].get("message", {}).get("content")
+    return content, {
+        "model": model,
+        "latency_ms": round((time.perf_counter() - started) * 1000),
+        "usage": result.get("usage", {}),
+    }
+
+
+def field_values(contexts, page, history):
+    """Every field value a step needs, in one call.
+
+    Asked one at a time these are strictly serial, and each costs about 600ms, so a form's cost
+    grew by that much per field while the decisions behind them stayed at one call however many
+    there were. They do not depend on each other: each is a sub-goal and a field. Asked together
+    they cost one call once.
+    """
+    payload = {
+        "fields": {
+            field_id: {"goal": goal, "field": field_brief(action)}
+            for field_id, (goal, action) in contexts.items()
+        },
+        "page": {"title": page["title"], "text": (page.get("text") or "")[:6000]},
+        "recent_actions": recent_actions(history),
+    }
+    content, spent = text_helper(TEXT_VALUES, payload)
     try:
         output = field_value(content)
     except (ValueError, TypeError):
@@ -304,29 +327,24 @@ def field_values(contexts, page, history):
         for field_id, value in (output or {}).items()
         if field_id in contexts and isinstance(value, str) and value.strip() and len(value) <= 2000
     }
-    return values, {
-        "model": model,
-        "latency_ms": round((time.perf_counter() - started) * 1000),
-        "usage": result.get("usage", {}),
-        "fields": len(values),
-    }
+    return values, {**spent, "fields": len(values)}
 
 
 def field_context(goal, action, page, history):
     return {
         "goal": goal,
-        "field": {k: action.get(k) for k in ("label", "role", "value")},
+        "field": field_brief(action),
         "page": {"title": page["title"], "text": page["text"][:6000]},
-        "recent_actions": [{k: h.get(k) for k in ("action", "text")} for h in history[-6:]],
+        "recent_actions": recent_actions(history),
     }
 
 
 def field_value(content):
-    """The JSON object a text helper meant to send, out of what it actually sent.
+    """The JSON object inside a text helper's reply.
 
     Asking for a JSON object does not guarantee one arrives alone: a model may fence it, introduce
-    it, or follow it with a remark. Recovering the object costs nothing and does not widen what
-    counts as a valid answer - the value inside it is still checked as strictly as before.
+    it, or follow it with a remark. Recovering the object does not widen what counts as a valid
+    answer, because the value inside it is checked by the caller either way.
     """
     text = (content or "").strip()
     if text.startswith("```"):
@@ -339,33 +357,7 @@ def field_value(content):
 
 
 def field_text(context):
-    key = os.environ.get("TEXT_MODEL_API_KEY")
-    if not key:
-        raise ValueError("TYPE_TEXT needs TEXT_MODEL_API_KEY; no text is hardcoded or guessed by the executor.")
-    base = os.environ.get("TEXT_MODEL_BASE_URL", "https://api.deepseek.com/v1").rstrip("/")
-    model = os.environ.get("TEXT_MODEL", "deepseek-chat")
-    reasoning = {"thinking": {"type": "disabled"}} if "api.deepseek.com/" in base else {"reasoning": {"effort": "low"}}
-    if os.environ.get("TEXT_MODEL_REASONING") == "none":
-        reasoning = {"reasoning": {"enabled": False}}
-    started = time.perf_counter()
-    result = post_json(
-        base + "/chat/completions",
-        key,
-        {
-            "model": model,
-            "max_tokens": 4096,
-            "response_format": {"type": "json_object"},
-            **reasoning,
-            "messages": [
-                {"role": "system", "content": TEXT_VALUE},
-                {
-                    "role": "user",
-                    "content": json.dumps(context),
-                },
-            ],
-        },
-    )
-    content = (result.get("choices") or [{}])[0].get("message", {}).get("content")
+    content, spent = text_helper(TEXT_VALUE, context)
     try:
         output = field_value(content)
         value = output["text"]
@@ -376,8 +368,4 @@ def field_text(context):
         raise ValueError(
             f"Text helper returned no valid field value; nothing typed. Got: {str(content)[:120]!r}"
         ) from None
-    return value, {
-        "model": model,
-        "latency_ms": round((time.perf_counter() - started) * 1000),
-        "usage": result.get("usage", {}),
-    }
+    return value, spent

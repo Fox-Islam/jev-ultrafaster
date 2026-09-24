@@ -94,6 +94,7 @@ class Handler(BaseHTTPRequestHandler):
             "/app.js": ("app.js", "text/javascript"),
             "/style.css": ("style.css", "text/css"),
             "/fixture.html": ("fixture.html", "text/html"),
+            "/restless.html": ("restless.html", "text/html"),
         }
         if path not in files:
             return self.send(404, "Not found", "text/plain")

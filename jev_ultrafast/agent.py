@@ -1,10 +1,12 @@
 """The complete agent loop. Typed choices, observable state, bounded execution."""
 
 import base64
+import os
+import threading
 import time
 from pathlib import Path
 
-from .browser import Browser, StalePage
+from .browser import RESTLESS, Browser, StalePage, operable
 from .model import action_space, choose, field_context, field_text, field_values
 from .questions import FIXATION_REPEATS, FIXATION_WINDOW, MAX_STEPS, PLAN_SATISFIED, TEXT_ATTEMPTS
 
@@ -16,7 +18,7 @@ class Agent:
         task = "\n".join(steps)
         if not task:
             raise ValueError("Supply a task")
-        # Tracking asks per sub-goal, so it needs them kept apart rather than joined into one string.
+        # Tracking asks per sub-goal, so it needs them kept apart instead of joined into one string.
         self.track_plan = track_plan and len(steps) > 1
         plan = steps if self.track_plan else [task]
         # A sub-goal can be satisfied by an action aimed at another, so this is a set, not an index.
@@ -28,6 +30,10 @@ class Agent:
         self.reused = 0
         self.pending_text = None
         self.text_failures = 0
+        self.speculating = os.environ.get("JEV_SPECULATE", "1") != "0"
+        self.guessing, self.guessed = None, None
+        self.unfresh_since = None
+        self.guesses, self.guesses_used = 0, 0
         self.browser = Browser(url)
         self.record_dir = Path(record_dir) if record_dir else None
         self.screenshots = screenshots or bool(record_dir)
@@ -79,8 +85,6 @@ class Agent:
                 raise ValueError("Start a demo first")
             if state["started_at"] is None:
                 state["started_at"] = time.perf_counter()
-            if not state["browser"].fresh(state["page"]):
-                state["page"] = state["browser"].settle(screenshot=self.screenshots, stabilise=True)
             state["decision"] = None
             if state["status"] in {"done", "blocked"}:
                 raise ValueError("This run has stopped. Start a fresh demo.")
@@ -91,23 +95,29 @@ class Agent:
                 if getattr(self, "track_plan", False)
                 else []
             )
-            # A held answer that still applies replaces this turn's call. Checking costs one local
-            # lookup over the current snapshot; being wrong costs the call that would have happened.
-            reused = self.reuse_held(outstanding) if self.reuse_held_answers else None
+            reused = self.reuse_held(outstanding) if getattr(self, "reuse_held_answers", False) else None
             if reused:
                 state["decision"] = reused
                 self.reused += 1
                 state["status"] = "predicted"
                 return self.snapshot()
-            state["decision"] = choose(
-                state["page"],
+            asked_about = state["page"]
+            arguments = (
                 state["goal"],
                 state["history"],
                 [state["plan"][i] for i in outstanding],
                 self.fixated(),
             )
-            # These readings describe the page this call saw, so a sub-goal retires in the same call
-            # that measured it. Retiring is one-way: the question is not asked again.
+            ahead = self.take_guess(state["page"]["fingerprint"]) if self.guessing_ahead() else None
+            if ahead is not None:
+                state["decision"] = ahead
+            if ahead is None and not self.settled_or_restless(asked_about):
+                # Without `previous`, so this waits for stillness. Naming the page makes it a
+                # readiness check instead, which is quicker and fails one run in three: the wait is
+                # what keeps a decision from being taken on a moving page and then rejected.
+                state["page"] = state["browser"].settle(screenshot=self.screenshots)
+            if state["decision"] is None:
+                state["decision"] = choose(state["page"], *arguments)
             for index, entry in zip(outstanding, state["decision"].get("plan") or []):
                 satisfied = entry["satisfied"]
                 if satisfied is not None and satisfied >= PLAN_SATISFIED:
@@ -142,7 +152,7 @@ class Agent:
                 return self.snapshot()
             selected = decision["choice"]
             if selected in {"DONE", "BLOCKED"}:
-                if not state["browser"].fresh(page):
+                if not self.settled_or_restless(page):
                     state["status"] = "ready"
                     raise StalePage("Page changed since the decision. Choose again.")
                 state["status"] = "done" if selected == "DONE" else "blocked"
@@ -155,7 +165,7 @@ class Agent:
                 raise ValueError(f"Stopped at the {MAX_STEPS}-action demo budget")
             text, helper = None, None
             if action["kind"] == "fill":
-                if not state["browser"].fresh(page):
+                if not self.settled_or_restless(page):
                     raise StalePage("Page changed before text generation. Choose again.")
                 # A held decision was taken for one sub-goal, so that is what the field is for.
                 # Handing over the whole task instead invites a value inferred from the wrong part
@@ -173,8 +183,8 @@ class Agent:
                     try:
                         text, helper = field_text(context)
                     except ValueError:
-                        # The helper answered with nothing usable. No input has been sent yet, so
-                        # this decision can simply be taken again; it is not a mutation retry.
+                        # The helper answered with nothing usable. No input has been sent, so the
+                        # decision can be taken again; this is not a mutation retry.
                         self.text_failures += 1
                         if self.text_failures > TEXT_ATTEMPTS:
                             raise
@@ -184,7 +194,7 @@ class Agent:
                     self.pending_text = (context, text, helper)
                     state["text_calls"].append({**helper, "field": action["label"], "value": text})
             # Browser.act checks freshness immediately before input, including after text generation.
-            state["browser"].act(action, page, text=text)
+            state["browser"].act(action, page, text=text, insist=self.restless())
             self.pending_text = None
             state["elapsed_ms"] = round((time.perf_counter() - state["started_at"]) * 1000)
             # Record execution before observing. A stale post-action observation must not erase the action.
@@ -209,7 +219,11 @@ class Agent:
                     "elapsed_ms": state["elapsed_ms"],
                 }
             )
-            state["page"] = state["browser"].settle(screenshot=self.screenshots, previous=page)
+            state["page"] = state["browser"].settle(
+                screenshot=self.screenshots, previous=page,
+                glimpse=self.guess_ahead((state["goal"], state["history"], [], self.fixated()))
+                if self.guessing_ahead() else None,
+            )
             state["elapsed_ms"] = round((time.perf_counter() - state["started_at"]) * 1000)
             state["history"][-1].update(
                 page_changed=state["page"]["fingerprint"] != page["fingerprint"],
@@ -230,6 +244,66 @@ class Agent:
             raise ValueError("Unknown command")
         return self.snapshot()
 
+    def restless(self):
+        """Whether the page has gone so long without holding still that waiting is futile.
+
+        The wait has already run by this point, and run again. A page that will never satisfy a
+        check that it stopped changing would otherwise never be acted on at all.
+        """
+        since = getattr(self, "unfresh_since", None)
+        return since is not None and time.perf_counter() - since >= RESTLESS
+
+    def settled_or_restless(self, page):
+        """Report whether the page still matches, and keep the clock on how long it has not."""
+        if self.state["browser"].fresh(page):
+            self.unfresh_since = None
+            return True
+        if getattr(self, "unfresh_since", None) is None:
+            self.unfresh_since = time.perf_counter()
+        return self.restless()
+
+    def guessing_ahead(self):
+        """Whether decisions may start before the page they are about has settled."""
+        return getattr(self, "speculating", False)
+
+    def guess_ahead(self, arguments):
+        """Start deciding about a page while the wait is watching it.
+
+        A decision takes about as long as a wait, and the two need not be consecutive: the page a
+        wait ends on is usually the page it was showing part way through. The answer is kept only
+        when the settled page is the one it was asked about, so nothing is acted on early. A wrong
+        guess costs one wasted call and no wall-clock, since it ran inside the wait.
+        """
+        def ask(page, arguments):
+            try:
+                self.guessed = (page["fingerprint"], choose(page, *arguments))
+            except Exception:  # noqa: BLE001
+                self.guessed = None
+
+        def glimpse(page):
+            if self.guessing is not None and self.guessing.is_alive():
+                return  # one question in flight at a time; the newest page gets the next one
+            asked = self.guessed[0] if self.guessed else None
+            if page["fingerprint"] == asked or not operable(page):
+                return
+            self.guesses += 1
+            self.guessing = threading.Thread(target=ask, args=(page, arguments), daemon=True)
+            self.guessing.start()
+
+        return glimpse
+
+    def take_guess(self, fingerprint):
+        """A decision already made about this exact page, if one was."""
+        if getattr(self, "guessing", None) is not None:
+            # Started before the page settled, so it is either already the answer or about to be.
+            self.guessing.join()
+            self.guessing = None
+        guessed, self.guessed = getattr(self, "guessed", None), None
+        if guessed and guessed[0] == fingerprint:
+            self.guesses_used += 1
+            return guessed[1]
+        return None
+
     def fixated(self):
         """Controls chosen more than once in the recent past without moving the page.
 
@@ -246,18 +320,28 @@ class Agent:
         return {key for key, count in seen.items() if count >= FIXATION_REPEATS}
 
     def fetch_values(self, state):
-        """Ask for every field value this step will need, in one call rather than one each.
+        """Ask for every field value this step will need, in one call instead of one each.
 
         The decisions just taken say which sub-goals are fills and which control each means, so the
-        values can be had together. Asked one at a time they are serial and each costs about 600ms,
-        which is what made a form cost more per field while its decisions stayed at one call.
+        values can be asked for together. `field_values` carries what asking separately costs.
         """
-        self.ready_values = {}
         wanted, page = {}, state["page"]
+        # A value is kept while its field is present and empty, and dropped once the field holds
+        # something. Dropping on absence instead loses the batch whenever a decision is retried, or
+        # whenever a field sits behind an open suggestion list, and the values are then fetched
+        # again one at a time - twice the calls, for a saving.
+        carries_value = {
+            action["label"] for action in page["actions"] if action["kind"] == "fill" and action.get("value")
+        }
+        self.ready_values = {
+            label: value for label, value in getattr(self, "ready_values", {}).items() if label not in carries_value
+        }
         decision = state["decision"] or {}
         if decision.get("operation") == "TYPE_TEXT":
             acting = next((a for a in page["actions"] if a["id"] == decision.get("choice")), None)
-            if acting is not None and acting["kind"] == "fill" and not acting.get("value"):
+            # Whatever it already holds: the decision is to type here, and a field arriving with
+            # something in it - a city guessed from the connection, say - is one to replace.
+            if acting is not None and acting["kind"] == "fill" and acting["label"] not in self.ready_values:
                 wanted[acting["label"]] = (state["goal"], acting)
         for index, entry in self.held.items():
             if entry.get("operation") != "TYPE_TEXT" or not entry.get("label"):
@@ -265,16 +349,36 @@ class Agent:
             matches = [a for a in page["actions"] if a["label"] == entry["label"] and a["kind"] == "fill"]
             if len(matches) != 1 or matches[0].get("value") or matches[0]["label"] in wanted:
                 continue
+            if matches[0]["label"] in self.ready_values:
+                continue
             wanted[matches[0]["label"]] = (state["plan"][index], matches[0])
+        # Sub-goals are one way to know a field will be filled; the page is another. Empty fields
+        # with names of their own are going to be filled from this goal or not at all, and asking
+        # for their values now costs a call that is already being made. A value never used is the
+        # waste; a value waited for one field at a time was the cost.
+        if decision.get("operation") == "TYPE_TEXT":
+            labels = [a["label"] for a in page["actions"] if a["kind"] == "fill"]
+            for action in page["actions"]:
+                if action["kind"] != "fill" or action.get("value") or action["label"] in wanted:
+                    continue
+                if action["label"] in self.ready_values:
+                    continue
+                if labels.count(action["label"]) == 1:
+                    wanted[action["label"]] = (state["goal"], action)
         if len(wanted) < 2:
             return  # one field is one call either way
+        # Keyed by position, not by the field's name. A name has to survive being echoed back
+        # exactly, and a name it tidies on the way is a value dropped and fetched again one at a
+        # time - which is what the batch was for.
+        numbered = {f"f{n}": pair for n, pair in enumerate(wanted.values())}
+        labels = {f"f{n}": label for n, label in enumerate(wanted)}
         try:
-            values, helper = field_values(wanted, page, state["history"])
+            values, helper = field_values(numbered, page, state["history"])
         except (ValueError, RuntimeError):
             return  # each field falls back to its own call
         if helper:
             state["text_calls"].append({**helper, "field": f"{len(values)} fields", "value": None})
-        self.ready_values = values
+        self.ready_values.update({labels[key]: value for key, value in values.items() if key in labels})
 
     def reuse_held(self, outstanding):
         """A decision held for a sub-goal, re-resolved against the page as it is now.

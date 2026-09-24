@@ -19,7 +19,7 @@ The optimized runtime was faster in all three pairs. Median task time was **25.0
 
 The original arm is the frozen source from `68c077bf79caca4e817b8e8a5854b2efa0c81ff6`. Both arms use Mercury so the runtime comparison does not conflate a helper-model change with code changes. Per-run source hashes, model settings, token counts, helper costs, browser version, protocol counts, and verification results are in the measurement JSON.
 
-These runs searched for 20 September 2026, and the figures above are the record of that day. The task now departs 30 days from whenever it runs, because a fixed date expires: from 21 September 2026 on no runtime could pass it, since the site sells no seats on a past day and the checker looks for them. `JEV_FLIGHTS_DATE` pins a specific day, and each run records its own `departure_date` — the task hash moves with the date and no longer identifies the task by itself.
+These runs searched for 20 September 2026, which is what the figures above measure. The task departs 30 days from whenever it runs, because a fixed date expires: the site sells no seats on a past day and the checker looks for them. `JEV_FLIGHTS_DATE` pins a specific day, and each run records its own `departure_date`, since the task hash moves with the date and does not identify the task by itself.
 
 ## Where the time went
 
@@ -52,6 +52,23 @@ A six-call helper probe used the two real flight-field contexts with Gemini 2.5 
 
 The previous 11.387-second recording and post-recording 12.898-second policy regression are described in the [original performance report](https://github.com/browser-use/jev-ultrafast/blob/68c077bf79caca4e817b8e8a5854b2efa0c81ff6/docs/performance.md). The older prepared-step prototype remains in [performance-prepared.md](performance-prepared.md). Raw attempts and original-timestamp frames remain in ignored local artifacts.
 
+## Pages that never hold still
+
+A page can refuse to settle in two ways, and each defeats a different signal. `restless.html` is
+both, selected by a query string, and `scripts/measure_waits.py` drives them:
+
+    uv run python scripts/measure_waits.py --runs 3
+
+`?paint` repaints forever through a CSS animation while its document stays unchanged, so stillness
+read from the screen never arrives and the wait falls back to the document. `?dom` rewrites its own
+text every frame as well, so neither signal reads still and a whole-page freshness check can never
+pass; finishing depends on the restlessness deadline instead. Both pages offer the same two
+controls from the first paint, so a run that does not finish was stopped by the waiting.
+
+Three alternating runs of each on the current code: `paint` 2/2 finished, median 1,790 ms; `dom`
+2/2 finished, median 7,964 ms. The script alternates the two pages and ends a run that stops
+executing actions, because a regression in the waiting shows up as a hang.
+
 ## Limits
 
-This DOM reader supports common HTML and ARIA controls; it does not implement the full accessible-name algorithm or traverse shadow roots/frames. Scoped click guards deliberately allow unrelated visible updates. Canvas, uploads, new tabs, nested scrolling, and arbitrary keyboard widgets remain unsupported. A valid operation can still be wrong, and DONE is never independent evidence of success.
+This DOM reader supports common HTML and ARIA controls; it does not implement the full accessible-name algorithm or traverse shadow roots. Cross-origin frames are read when `JEV_FRAMES` names the page, or when the page itself offers nothing to act on. Scoped click guards deliberately allow unrelated visible updates. Canvas, uploads, new tabs, nested scrolling, and arbitrary keyboard widgets remain unsupported. A valid operation can still be wrong, and DONE is never independent evidence of success.

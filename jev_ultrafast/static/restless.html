@@ -1,0 +1,61 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <title>Restless page</title>
+    <style>
+      body { margin: 0; padding: 40px; font: 15px system-ui, sans-serif; color: #343e38; background: #fcfcf8; }
+      h1 { font-family: Georgia, serif; font-size: 26px; margin: 0 0 4px; }
+      p.note { color: #6b7a70; margin: 0 0 28px; }
+      .spinner {
+        width: 56px; height: 56px; border: 7px solid #dce2d8; border-top-color: #4a7c59;
+        border-radius: 50%; animation: spin 0.7s linear infinite;
+      }
+      @keyframes spin { to { transform: rotate(360deg); } }
+      .clock { font-variant-numeric: tabular-nums; font-size: 22px; margin: 18px 0; }
+      label { display: block; margin: 20px 0 6px; }
+      input { font-size: 16px; padding: 9px 12px; width: 280px; border: 1px solid #c3cdbf; border-radius: 6px; }
+      button { font-size: 16px; padding: 10px 18px; margin-top: 18px; border: 0; border-radius: 6px;
+               background: #4a7c59; color: #fff; }
+      #done { color: #2f5d3f; font-weight: 600; min-height: 22px; margin-top: 18px; }
+    </style>
+  </head>
+  <body>
+    <h1>Restless page</h1>
+    <p class="note" id="mode"></p>
+    <div class="spinner"></div>
+    <p class="clock">Elapsed: <span id="clock">0.00</span>s</p>
+    <label for="name">Your name</label>
+    <input id="name" placeholder="name" />
+    <p><button id="go">Continue</button></p>
+    <p id="done"></p>
+    <script>
+      // Two ways a page can refuse to hold still, selected by ?paint (default) or ?dom.
+      //
+      //   paint - a CSS animation repaints forever while the document stays unchanged. Stillness
+      //           read from the screen is never reached; stillness read from the document is.
+      //   dom   - the elapsed time is rewritten every frame, so neither the screen nor the
+      //           document ever holds still, and a whole-page freshness check can never pass.
+      //
+      // Both offer the same two controls throughout, so a run that cannot finish was stopped by
+      // the waiting and not by the page.
+      const mode = new URLSearchParams(location.search).has('dom') ? 'dom' : 'paint';
+      document.getElementById('mode').textContent =
+        mode === 'dom'
+          ? 'Repainting and rewriting its own text every frame.'
+          : 'Repainting every frame; the document does not change.';
+      const started = performance.now();
+      const clock = document.getElementById('clock');
+      function tick() {
+        if (mode === 'dom') {
+          clock.textContent = ((performance.now() - started) / 1000).toFixed(2);
+        }
+        requestAnimationFrame(tick);
+      }
+      requestAnimationFrame(tick);
+      document.getElementById('go').addEventListener('click', () => {
+        document.getElementById('done').textContent = 'Thank you, your details were received.';
+      });
+    </script>
+  </body>
+</html>

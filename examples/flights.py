@@ -1,9 +1,8 @@
 """Live Google Flights search. Calls TypeSafe; never selects or books a flight.
 
-The departure date rolls forward from today. A fixed date expires: this task named 20 September
-2026, and from 21 September 2026 on, no runtime could pass it, because the site returns no flights
-for a past day and the checker below looks for them. Pin a date with JEV_FLIGHTS_DATE to reproduce
-one run; leave it unset to measure.
+The departure date rolls forward from today, because a fixed one expires: the site returns no
+flights for a past day and the checker below looks for them. Pin a date with JEV_FLIGHTS_DATE to
+reproduce one run; leave it unset to measure.
 """
 
 import argparse
@@ -20,7 +19,7 @@ URL = "https://www.google.com/travel/flights?hl=en"
 DAYS_AHEAD = 30
 
 # Google renders the page in English (hl=en) and the checks below match its strings, so the names
-# are spelled out rather than taken from the process locale.
+# are spelled out instead of taken from the process locale.
 WEEKDAYS = ("Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday", "Sunday")
 MONTHS = ("January", "February", "March", "April", "May", "June",
           "July", "August", "September", "October", "November", "December")

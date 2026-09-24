@@ -406,28 +406,8 @@ def test_suppression_never_empties_the_action_space(monkeypatch):
     monkeypatch.setattr(model, "post_json", post)
     everything = {("Open Search", "click"), ("Go", "click"), ("Search", "fill")}
     model.choose(page(), "Find a book", [], (), everything)
-    assert sent["questions"]["click_target"]["criteria"]  # fell back rather than stranding the run
+    assert sent["questions"]["click_target"]["criteria"]  # fell back instead of stranding the run
 
-
-def observation(url="https://example.test/", actions=None, expanded=None):
-    acts = [{"id": f"e{i}", "kind": "click", "label": f"c{i}", "node": i} for i in range(actions or 10)]
-    for a in acts[:expanded or 0]:
-        a["expanded"] = "true"
-    return {"url": url, "actions": acts}
-
-
-@pytest.mark.parametrize(
-    "before,after,expected,why",
-    [
-        (observation(), observation(url="https://example.test/next"), True, "navigation"),
-        (observation(expanded=0), observation(expanded=1), True, "a menu or dialog opened"),
-        (observation(actions=10), observation(actions=14), True, "what is on offer changed a lot"),
-        (observation(actions=10), observation(actions=12), False, "a small change is not arrival"),
-        (observation(), observation(), False, "nothing changed"),
-    ],
-)
-def test_only_arriving_pages_are_waited_for(before, after, expected, why):
-    assert browser_module.unsettling(before, after) is expected, why
 
 
 def test_an_unusable_field_value_is_retried_not_fatal(runner, monkeypatch):
@@ -510,5 +490,146 @@ def test_a_value_that_does_not_hold_up_is_left_out(monkeypatch, content, kept):
         "a": ("goal a", {"label": "A", "role": "textbox", "value": ""}),
         "b": ("goal b", {"label": "B", "role": "textbox", "value": ""}),
     }
-    # A field left out here falls back to its own call rather than being filled with a guess.
+    # A field left out here falls back to its own call instead of being filled with a guess.
     assert model.field_values(fields, page(), [])[0] == kept
+
+
+def observation(url="https://example.test/", actions=10, expanded=0):
+    acts = [{"id": f"e{i}", "kind": "click", "label": f"c{i}", "node": i} for i in range(actions)]
+    for a in acts[:expanded]:
+        a["expanded"] = "true"
+    return {"url": url, "actions": acts}
+
+
+@pytest.mark.parametrize(
+    "before,after,expected,why",
+    [
+        (observation(), observation(url="https://example.test/next"), True, "navigation"),
+        (observation(expanded=0), observation(expanded=1), True, "a menu or dialog opened"),
+        (observation(actions=10), observation(actions=14), True, "what is on offer changed a lot"),
+        (observation(actions=10), observation(actions=12), False, "a small change is not arrival"),
+        (observation(), observation(), False, "nothing changed"),
+    ],
+)
+def test_only_arriving_pages_are_waited_for(before, after, expected, why):
+    assert browser_module.unsettling(before, after) is expected, why
+
+
+def watched_browser(monkeypatch, events, started=True):
+    b = browser_module.Browser.__new__(browser_module.Browser)
+    b.session = "test"
+    calls = []
+
+    def call(method, **params):
+        calls.append(method)
+        if method == "Page.startScreencast" and not started:
+            raise RuntimeError("no screencast here")
+        return {}
+
+    b.call = call
+    monkeypatch.setattr(browser_module, "drain_events", lambda: events.pop(0) if events else [])
+    return b, calls
+
+
+def frame():
+    return [{"method": "Page.screencastFrame", "params": {"sessionId": 1}}]
+
+
+def test_a_screen_that_stops_painting_settles_the_page(monkeypatch):
+    b, calls = watched_browser(monkeypatch, [frame(), [], [], [], [], [], [], [], []])
+    settled = page()
+    b.observe = lambda screenshot=False: settled
+    monkeypatch.setattr(browser_module, "SETTLE_PAINT", 0.02)
+    assert b.still_screen(False, time.monotonic() + 2) is settled
+    assert "Page.screencastFrameAck" in calls
+
+
+def test_a_screen_that_never_reports_is_left_to_the_document(monkeypatch):
+    b, _ = watched_browser(monkeypatch, [], started=False)
+    b.observe = lambda screenshot=False: page()
+    assert b.still_screen(False, time.monotonic() + 2) is None
+    assert b.watching_paint() is False
+
+
+def test_a_screen_that_never_paints_is_asked_once_and_then_left_alone(monkeypatch):
+    b, _ = watched_browser(monkeypatch, [])
+    b.observe = lambda screenshot=False: page()
+    began = time.monotonic()
+    assert b.still_screen(False, began + 5) is None
+    # Given up on quickly whatever the watching budget is, and not retried on the next wait.
+    assert time.monotonic() - began < browser_module.SETTLE_WATCH / 2
+    assert b.screencast is False
+
+
+def test_a_screen_that_never_stops_painting_is_left_to_the_document(monkeypatch):
+    b, _ = watched_browser(monkeypatch, [])
+    monkeypatch.setattr(browser_module, "drain_events", frame)
+    b.observe = lambda screenshot=False: page()
+    monkeypatch.setattr(browser_module, "SETTLE_WATCH", 0.2)
+    began = time.monotonic()
+    assert b.still_screen(False, began + 5) is None
+    assert time.monotonic() - began >= 0.2
+
+
+def test_only_a_frame_counts_as_the_screen_having_painted(monkeypatch):
+    other = {"method": "Network.responseReceived", "params": {}}
+    b, calls = watched_browser(monkeypatch, [[other], [other] + frame()])
+    b.observe = lambda screenshot=False: page()
+    # A drain that found no frame leaves the page never having painted, and acks nothing.
+    assert b.painted() is None
+    assert calls == []
+    assert b.painted() is not None
+    assert calls == ["Page.screencastFrameAck"]
+
+
+def test_a_report_left_running_by_an_earlier_reader_is_accepted(monkeypatch):
+    b, _ = watched_browser(monkeypatch, [])
+
+    def refuse(method, **params):
+        raise RuntimeError({"code": -32000, "message": "Screencast is already active"})
+
+    b.call = refuse
+    assert b.watching_paint() is True
+
+
+def test_closing_the_page_stops_it_reporting(monkeypatch):
+    b, calls = watched_browser(monkeypatch, [])
+    b.screencast, b.target = True, None
+    monkeypatch.setenv("JEV_KEEP_OPEN", "0")
+    b.close()
+    assert "Page.stopScreencast" in calls
+
+
+def restless_agent(fresh_answers):
+    runner = loop.Agent.__new__(loop.Agent)
+    runner.state = {"browser": Mock(fresh=Mock(side_effect=fresh_answers))}
+    runner.unfresh_since = None
+    return runner
+
+
+def test_a_page_that_holds_still_is_never_called_restless():
+    runner = restless_agent([True, True])
+    assert runner.settled_or_restless(page()) is True
+    assert runner.restless() is False
+    assert runner.unfresh_since is None
+
+
+def test_a_page_that_keeps_changing_is_acted_on_once_waiting_is_futile(monkeypatch):
+    monkeypatch.setattr(loop, "RESTLESS", 0.05)
+    runner = restless_agent([False, False, False])
+    # The first refusal starts the clock instead of giving up on the spot.
+    assert runner.settled_or_restless(page()) is False
+    time.sleep(0.06)
+    assert runner.settled_or_restless(page()) is True
+    assert runner.restless() is True
+
+
+def test_holding_still_again_clears_the_restless_clock(monkeypatch):
+    monkeypatch.setattr(loop, "RESTLESS", 0.05)
+    runner = restless_agent([False, True, False])
+    runner.settled_or_restless(page())
+    runner.settled_or_restless(page())
+    assert runner.unfresh_since is None
+    time.sleep(0.06)
+    # A fresh refusal starts a fresh clock; earlier unsettledness is not carried over.
+    assert runner.settled_or_restless(page()) is False
