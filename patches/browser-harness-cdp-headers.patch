@@ -1,0 +1,64 @@
+Send custom headers with the CDP connection (browser-harness 0.1.13)
+
+A hosted CDP endpoint authenticates the WebSocket handshake with a header rather than through
+the URL, so BU_CDP_WS alone cannot reach one. Cloudflare Browser Rendering is such an endpoint.
+cdp_use.CDPClient already accepts additional_headers; the daemon built it without them, and
+resolved BU_CDP_URL/json/version without them either.
+
+BU_CDP_HEADERS carries a JSON object. An unreadable value is treated as unset, so a malformed
+setting cannot become a header.
+
+--- a/browser_harness/daemon.py
++++ b/browser_harness/daemon.py
+@@ -261,6 +261,28 @@
+     return None
+ 
+ 
++def cdp_headers():
++    """Headers for the CDP endpoint, from BU_CDP_HEADERS as a JSON object.
++
++    A hosted endpoint authenticates the handshake rather than the URL, so the token cannot
++    travel in BU_CDP_WS. Anything unreadable is treated as unset: a malformed value must not
++    silently become a header, and the handshake failure that follows names the endpoint
++    rather than the setting.
++    """
++    raw = os.environ.get("BU_CDP_HEADERS", "").strip()
++    if not raw:
++        return {}
++    try:
++        headers = json.loads(raw)
++    except ValueError:
++        log("BU_CDP_HEADERS is not valid JSON; connecting without extra headers")
++        return {}
++    if not isinstance(headers, dict):
++        log("BU_CDP_HEADERS is not a JSON object; connecting without extra headers")
++        return {}
++    return {str(name): str(value) for name, value in headers.items()}
++
++
+ def get_ws_url():
+     if url := os.environ.get("BU_CDP_WS"):
+         return url
+@@ -273,7 +295,8 @@
+         base_url = url.rstrip("/")
+         while time.time() < deadline:
+             try:
+-                return json.loads(urllib.request.urlopen(f"{base_url}/json/version", timeout=5).read())["webSocketDebuggerUrl"]
++                request = urllib.request.Request(f"{base_url}/json/version", headers=cdp_headers())
++                return json.loads(urllib.request.urlopen(request, timeout=5).read())["webSocketDebuggerUrl"]
+             except urllib.error.HTTPError as e:
+                 last_err = e
+                 if e.code == 403:
+@@ -636,7 +659,11 @@
+         self.stop = asyncio.Event()
+         url = get_ws_url()
+         log(f"connecting to {_safe_connection_label(url)}")
+-        self.cdp = _PatientCDPClient(url) if BROWSER_KIND == "local" else CDPClient(url)
++        self.cdp = (
++            _PatientCDPClient(url)
++            if BROWSER_KIND == "local"
++            else CDPClient(url, additional_headers=cdp_headers() or None)
++        )
+         if BROWSER_KIND == "local":
+             # Allow while this handshake is still parked on the popup
+             log("handshake-wait: if Chrome shows an 'Allow remote debugging?' popup, click Allow")

@@ -633,3 +633,33 @@ def test_holding_still_again_clears_the_restless_clock(monkeypatch):
     time.sleep(0.06)
     # A fresh refusal starts a fresh clock; earlier unsettledness is not carried over.
     assert runner.settled_or_restless(page()) is False
+
+
+def harness_daemon():
+    """The installed daemon module, or a skip when it has not been taught about headers."""
+    daemon = pytest.importorskip("browser_harness.daemon")
+    if not hasattr(daemon, "cdp_headers"):
+        pytest.skip("browser-harness is unpatched; run scripts/patch_browser_harness.py")
+    return daemon
+
+
+def test_no_setting_sends_no_extra_headers(monkeypatch):
+    daemon = harness_daemon()
+    monkeypatch.delenv("BU_CDP_HEADERS", raising=False)
+    assert daemon.cdp_headers() == {}
+
+
+def test_a_json_object_becomes_the_headers(monkeypatch):
+    daemon = harness_daemon()
+    monkeypatch.setenv("BU_CDP_HEADERS", '{"Authorization": "Bearer t", "X-Count": 2}')
+    # Values are sent as text, so a number in the JSON is not passed through as one.
+    assert daemon.cdp_headers() == {"Authorization": "Bearer t", "X-Count": "2"}
+
+
+@pytest.mark.parametrize("setting", ["not json", "[1, 2]", '"a string"', "   "])
+def test_a_setting_that_is_not_a_json_object_sends_nothing(monkeypatch, setting):
+    daemon = harness_daemon()
+    monkeypatch.setenv("BU_CDP_HEADERS", setting)
+    # Nothing is invented from a malformed value: the endpoint then refuses the handshake, which
+    # names the endpoint, where a half-built header would name nothing.
+    assert daemon.cdp_headers() == {}

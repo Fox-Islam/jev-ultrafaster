@@ -65,6 +65,23 @@ Open **http://127.0.0.1:8766** and click **Start demo → Run automatically**. T
 
 Chrome connects through [Browser Harness](https://github.com/browser-use/browser-harness), installed by `uv sync`. Run `uv run browser-harness --doctor` if it needs connecting. Allow remote debugging in Chrome when prompted.
 
+### A hosted browser
+
+`BU_CDP_WS` points the harness at a remote CDP endpoint instead of local Chrome. An endpoint that
+authenticates the WebSocket handshake with a header, such as
+[Cloudflare Browser Rendering](https://developers.cloudflare.com/browser-run/cdp/), needs
+`BU_CDP_HEADERS` as well:
+
+```bash
+export BU_CDP_WS='wss://<endpoint>/devtools/browser'
+export BU_CDP_HEADERS='{"Authorization": "Bearer <api-token>"}'
+```
+
+browser-harness 0.1.13 builds its CDP connection without headers, so the setting needs
+`uv run python scripts/patch_browser_harness.py` first. The script is idempotent, reports whether
+it changed anything, and edits the installed package, so `uv sync` undoes it and it has to be run
+again. `patches/browser-harness-cdp-headers.patch` is the same change as a diff, for upstreaming.
+
 `TEXT_MODEL_API_KEY` is an OpenRouter key in the example configuration. The current demo uses `inception/mercury-2.5` with reasoning disabled. Gemini, GLM, and DeepSeek can also use the OpenAI-compatible text helper; configure the appropriate model, endpoint, and reasoning setting.
 
 ## Use the library
