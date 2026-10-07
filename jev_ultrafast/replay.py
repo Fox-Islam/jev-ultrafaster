@@ -32,7 +32,7 @@ RECONNECTS = 1
 def mutates(document):
     """Whether replaying this script twice would send anything twice."""
     return any(
-        step["kind"] in {"fill", "select"} or (step["kind"] == "click" and submits(step))
+        step["kind"] in {"fill", "select", "drag"} or (step["kind"] == "click" and submits(step))
         for step in document.get("steps") or []
     )
 
@@ -48,6 +48,9 @@ def script(state, name=None):
         recorded = {"kind": step["kind"], "label": step["action"]}
         if step.get("text") is not None:
             recorded["text"] = step["text"]
+        if step.get("drop"):
+            # Where it was dropped, named like the thing dragged, so both are found again by name.
+            recorded["drop"] = step["drop"]
         steps.append(recorded)
     history = state.get("history") or []
     return {
@@ -146,7 +149,10 @@ def run_once(document, browser, screenshots, on_step, done):
             for attempt in range(STEP_ATTEMPTS):
                 try:
                     action = control(page, step, number)
-                    browser.act(action, page, text=step.get("text"))
+                    # Passed only for a drag, so a browser written before drags still replays the rest.
+                    extra = {"drop": control(page, {"label": step["drop"], "kind": "drop"}, number)} \
+                        if step.get("drop") else {}
+                    browser.act(action, page, text=step.get("text"), **extra)
                     break
                 except StalePage:
                     # The page moved between being read and being acted on. Read it again; the

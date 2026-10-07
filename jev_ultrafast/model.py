@@ -7,7 +7,7 @@ import time
 
 import httpx
 
-from .questions import NEXT_ACTION, TARGET, TEXT_VALUE, TEXT_VALUES
+from .questions import DROP, NEXT_ACTION, TARGET, TEXT_VALUE, TEXT_VALUES
 
 CLIENT = httpx.Client(http2=True, timeout=25)
 
@@ -30,6 +30,14 @@ def describe_target(index, action):
     for flag in ("checked", "selected", "expanded"):
         if flag in action:
             parts.append(f"{flag}: {action[flag]}")
+    # Said, because the model cannot see either: a control that appears under the pointer, and
+    # one that is used by being brought into view, are both as usable as anything on screen.
+    if action.get("hover"):
+        parts.append("shown when hovered")
+    if action.get("offscreen") == "panel":
+        parts.append("out of view inside a scrolling panel")
+    elif action.get("offscreen") == "below":
+        parts.append("below the visible part of the page")
     return ", ".join(parts) + "."
 
 
@@ -97,16 +105,25 @@ def readable_only(actions):
     """
     return [
         action for action in actions
-        if action["kind"] not in {"fill", "select"} and not (action["kind"] == "click" and submits(action))
+        if action["kind"] not in {"fill", "select", "drag", "drop"}
+        and not (action["kind"] == "click" and submits(action))
     ]
+
+
+def drop_zones(actions):
+    """Where a drag can end, by index. These are places rather than operations, so they are kept
+    apart from the element table and asked about only when a drag is the operation chosen."""
+    return {str(n): action for n, action in enumerate((a for a in actions if a["kind"] == "drop"), 1)}
 
 
 def action_space(actions):
     """One index per observed element; each operation has its own valid target choices."""
     elements, indices, targets, controls = [], {}, {}, {}
-    operations = {"click": "CLICK", "fill": "TYPE_TEXT", "select": "SELECT"}
+    operations = {"click": "CLICK", "fill": "TYPE_TEXT", "select": "SELECT", "drag": "DRAG"}
     for action in actions:
         kind = action["kind"]
+        if kind == "drop":
+            continue
         if kind not in operations:
             controls[action["id"].upper()] = action
             continue
@@ -114,7 +131,8 @@ def action_space(actions):
         if node not in indices:
             index = str(len(elements) + 1)
             indices[node] = index
-            element = {k: action[k] for k in ("role", "value", "checked", "selected", "expanded") if k in action}
+            element = {k: action[k] for k in ("role", "value", "checked", "selected", "expanded", "hover", "offscreen")
+                   if k in action}
             element.update(index=index, label=action["label"].split(" → ")[0], operations=[])
             if kind == "select":
                 element["value"] = action.get("current_value", "")
@@ -224,8 +242,12 @@ def scrolling_still_helps(state, history):
     return not down or down[-1].get("page_changed") is not False
 
 
-def choose(state, goal, history, pending=(), suppress=()):
+def choose(state, goal, history, pending=(), suppress=(), allow_done=True):
     elements, targets, controls = action_space(state["actions"])
+    zones = drop_zones(state["actions"])
+    if not zones:
+        # A drag with nowhere to end is not an operation.
+        targets.pop("DRAG", None)
     # A control that has been chosen repeatedly without moving the page is not going to move it
     # this time either. Withholding it costs nothing and forces the next-best answer.
     if suppress:
@@ -240,10 +262,16 @@ def choose(state, goal, history, pending=(), suppress=()):
         "CLICK": "Click an element, button, menu option, autocomplete suggestion, or calendar day.",
         "TYPE_TEXT": "Enter or replace text in an editable field. A small LLM will supply the value from the goal.",
         "SELECT": "Select an observed dropdown value.",
+        "DRAG": "Drag an element and drop it onto an area or another element.",
     }
     operations = {key: labels[key] for key in targets}
     operations.update({key: value["label"] for key, value in controls.items()})
     operations.update(DONE="Every requirement is visibly satisfied.", BLOCKED="No supported operation can progress.")
+    if not allow_done:
+        # Steps are being checked one by one and some read unfinished, so finishing is decided by
+        # those checks agreeing, never by one broad judgement that the page looks done. That
+        # judgement is what answered DONE at 0.21 with the form it was meant to submit closed.
+        operations.pop("DONE")
     rules = [NEXT_ACTION]
     if scrolling_still_helps(state, history):
         # Withheld rather than argued against, the way a control that stopped moving the page is:
@@ -263,6 +291,12 @@ def choose(state, goal, history, pending=(), suppress=()):
             "type": "choice",
             "criteria": {index: describe_target(index, a) for index, a in candidates.items()},
             "instructions": flatten_instructions(goal, [NEXT_ACTION, TARGET], operation),
+        }
+    if "DRAG" in targets:
+        questions["drop_zone"] = {
+            "type": "choice",
+            "criteria": {index: describe_target(index, a) for index, a in zones.items()},
+            "instructions": flatten_instructions(goal, [NEXT_ACTION, DROP], "DRAG"),
         }
     questions.update(plan_questions(pending, operations, targets, settled))
     body = {
@@ -296,7 +330,11 @@ def choose(state, goal, history, pending=(), suppress=()):
     else:
         choice = controls[operation]["id"] if operation in controls else operation
         probabilities[choice] = operation_answer["probabilities"][operation]
+    drop = None
+    if operation == "DRAG":
+        drop = zones[validate_choice(result["answers"].get("drop_zone", {}), zones)["choice"]]["id"]
     return {
+        "drop": drop,
         "choice": choice,
         "operation": operation,
         "target": target,

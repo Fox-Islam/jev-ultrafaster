@@ -8,14 +8,16 @@ from pathlib import Path
 from urllib.parse import urlparse
 
 from . import session
-from .browser import RESTLESS, Browser, StalePage, diagnosis, operable
+from .browser import RESTLESS, Browser, Covered, StalePage, diagnosis, operable
 from .model import action_space, choose, field_context, field_text, field_values, readable_only, unseen
 from .questions import (
+    DOUBTFUL,
     EVIDENCE_TEXT,
     FIXATION_REPEATS,
     FIXATION_WINDOW,
     MAX_STEPS,
     PLAN_SATISFIED,
+    REFUSALS,
     TEXT_ATTEMPTS,
     UNSEEN_ENOUGH,
 )
@@ -128,7 +130,11 @@ class Agent:
             try:
                 self.command("predict", {})
                 return self.command("act", {"fingerprint": state["page"]["fingerprint"]})
-            except StalePage:
+            except StalePage as stale:
+                if isinstance(stale, Covered) and stale.action:
+                    key = (stale.action.get("label"), stale.action.get("kind"))
+                    self.refused = getattr(self, "refused", {})
+                    self.refused[key] = self.refused.get(key, 0) + 1
                 state["decision"] = None
                 state["status"] = "ready"
                 state["page"] = state["browser"].settle(screenshot=self.screenshots, stabilise=True)
@@ -163,6 +169,8 @@ class Agent:
                 state["history"],
                 [state["plan"][i] for i in outstanding],
                 self.fixated(),
+                # With steps tracked, finishing is their checks agreeing; see `choose`.
+                not outstanding,
             )
             ahead = self.take_guess(state["page"]["fingerprint"]) if self.guessing_ahead() else None
             if ahead is not None:
@@ -213,6 +221,8 @@ class Agent:
                     raise StalePage("Page changed since the decision. Choose again.")
                 if selected == "DONE":
                     state["status"] = "done"
+                    # The model's own word that it finished, at a confidence a caller should weigh.
+                    state["doubtful"] = (decision.get("confidence") or 0) < DOUBTFUL
                 else:
                     state["status"] = "blocked"
                     # A page read to the bottom without the thing on it is a different answer from
@@ -228,7 +238,11 @@ class Agent:
                 state["status"] = "budget"
                 state["elapsed_ms"] = round((time.perf_counter() - state["started_at"]) * 1000)
                 return self.snapshot()
-            text, helper = None, None
+            text, helper, drop = None, None, None
+            if action["kind"] == "drag":
+                drop = next((a for a in page["actions"] if a["id"] == decision.get("drop")), None)
+                if drop is None:
+                    raise StalePage("The drag's drop zone is not on this page. Choose again.")
             if action["kind"] == "fill":
                 if not self.settled_or_restless(page):
                     raise StalePage("Page changed before text generation. Choose again.")
@@ -259,8 +273,10 @@ class Agent:
                     self.pending_text = (context, text, helper)
                     state["text_calls"].append({**helper, "field": action["label"], "value": text})
             # Browser.act checks freshness immediately before input, including after text generation.
-            state["browser"].act(action, page, text=text, insist=self.restless())
+            state["browser"].act(action, page, text=text, insist=self.restless(), drop=drop)
             self.pending_text = None
+            # Something was sent, so the page has moved on from whatever refused the last choice.
+            self.refused = {}
             state["elapsed_ms"] = round((time.perf_counter() - state["started_at"]) * 1000)
             # Record execution before observing. A stale post-action observation must not erase the action.
             state["history"].append(
@@ -268,6 +284,7 @@ class Agent:
                     "step": len(state["history"]) + 1,
                     "action": action["label"],
                     "kind": action["kind"],
+                    "drop": drop["label"] if drop else None,
                     "choice": selected,
                     "probability": decision["probabilities"][selected],
                     "confidence": decision["confidence"],
@@ -333,7 +350,10 @@ class Agent:
         Read-only governs what this agent will do to a page, not what its caller may ask it: a
         question is the caller's own code, and running it is the point of asking.
         """
-        satisfied = len(state["plan"]) if state["status"] in {"done", "budget"} else len(self.plan_satisfied)
+        # A stopped run is asked everything it was going to be asked. A question is how a caller
+        # finds out why a run stopped where it did, so skipping it when the goals were not met
+        # withheld the answer exactly when it was needed.
+        satisfied = len(state["plan"]) if state["status"] in self.STOPPED else len(self.plan_satisfied)
         for index, question in enumerate(getattr(self, "asked", [])):
             if index in self.answered or question["after"] > satisfied:
                 continue
@@ -445,7 +465,10 @@ class Agent:
             if step.get("page_changed") is False and step.get("kind") != "wait":
                 key = (step["action"], step["kind"])
                 seen[key] = seen.get(key, 0) + 1
-        return {key for key, count in seen.items() if count >= FIXATION_REPEATS}
+        stuck = {key for key, count in seen.items() if count >= FIXATION_REPEATS}
+        # Refused as covered is the same shape without an entry in the history: chosen, and nothing
+        # happened. Those are counted where they are caught.
+        return stuck | {key for key, count in getattr(self, "refused", {}).items() if count >= REFUSALS}
 
     def fetch_values(self, state):
         """Ask for every field value this step will need, in one call instead of one each.
@@ -518,7 +541,8 @@ class Agent:
         state = self.state
         for index in outstanding:
             entry = self.held.get(index)
-            if not entry or entry["operation"] in {"DONE", "BLOCKED", "WAIT"}:
+            # A held drag named what to drag but not where to, which only a fresh decision asks.
+            if not entry or entry["operation"] in {"DONE", "BLOCKED", "WAIT", "DRAG"}:
                 continue
             matches = [
                 action

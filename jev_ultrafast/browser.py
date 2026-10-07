@@ -43,6 +43,19 @@ SETTLE_WATCH = float(os.environ.get("JEV_SETTLE_WATCH", "0.3"))
 # restless instead of arriving, and is acted on as it is.
 RESTLESS = float(os.environ.get("JEV_RESTLESS", "1.5"))
 SCREEN = {"format": "jpeg", "quality": 30, "maxWidth": 160, "maxHeight": 120, "everyNthFrame": 1}
+
+# How long an arriving page may keep fetching, or keep showing a loading state, before it is read
+# anyway. A single-page app paints its shell, holds still and is operable well before the list it
+# was opened for comes back, so stillness alone hands the decision a page without its content.
+SETTLE_BUSY = float(os.environ.get("JEV_SETTLE_BUSY", "1.5" if REMOTE else "8"))
+# The kinds of request a page draws from. Documents, scripts and images are covered by the load
+# event and by paint; beacons and pings draw nothing.
+FETCHES = {"XHR", "Fetch"}
+# A fetch open longer than this is a stream or a long poll, not content on its way.
+LONG_REQUEST = float(os.environ.get("JEV_LONG_REQUEST", "10"))
+# How often a page with nothing operable of its own is checked for controls inside its frames.
+# Reading the frames costs a listing and a read per frame, so it is not asked on every poll.
+FRAME_CHECK = 0.5
 VIEWPORT = (int(os.environ.get("JEV_VIEWPORT_WIDTH", "1120")), int(os.environ.get("JEV_VIEWPORT_HEIGHT", "780")))
 
 # How many of each kind of fault to keep. A page that fails one request per image would otherwise
@@ -97,6 +110,78 @@ STILL = """((still, timeout) => new Promise(resolve => {
 
 class StalePage(ValueError):
     """A decision no longer refers to the observed page."""
+
+
+class Covered(StalePage):
+    """The chosen control is there but cannot be reached: something sits over it, or it never
+    appeared under the pointer. Nothing was sent. Choosing it again finds it covered again, so the
+    agent counts these and stops offering a control that keeps being refused."""
+
+    def __init__(self, message, action=None):
+        super().__init__(message)
+        self.action = action or {}
+
+
+# Find the observed node and bring it to where it can be used. A control below the fold of a
+# scrolling panel, or of the page, is scrolled into view here rather than by a separate step, so
+# offering it costs the model nothing. Visibility is checked without opacity, because a control
+# revealed on hover is transparent until the pointer reaches it; that is settled after the hover.
+LOCATE = """(async action => {
+  const e=window.__jevFast?.nodes.get(action.node);
+  const across=(n,s)=>{
+    for(;n;n=n.parentElement||n.getRootNode()?.host) if(n.matches?.(s)) return true;
+    return false;
+  };
+  if (!e?.isConnected || e.matches(':disabled') || across(e,'[aria-disabled="true"],[inert],[aria-hidden="true"]') ||
+      !e.checkVisibility({checkVisibilityCSS:true})) return null;
+  if (action.kind==='fill' && (e.readOnly || e.getAttribute('aria-readonly')==='true')) return null;
+  let r=e.getBoundingClientRect();
+  // Inside the window and inside every scrolling ancestor, which is where it is actually drawn.
+  const inside=()=>{
+    const x=r.x+r.width/2, y=r.y+r.height/2;
+    if (!r.width || !r.height || x<0 || y<0 || x>=innerWidth || y>=innerHeight) return false;
+    for (let n=e.parentElement; n && n!==document.body; n=n.parentElement) {
+      const style=getComputedStyle(n);
+      if (!/(auto|scroll|overlay|hidden)/.test(style.overflowY+style.overflowX)) continue;
+      const p=n.getBoundingClientRect();
+      if (x<p.left || x>p.right || y<p.top || y>p.bottom) return false;
+    }
+    return true;
+  };
+  if (!inside()) {
+    e.scrollIntoView({block:'center',inline:'center'});
+    await new Promise(done=>requestAnimationFrame(()=>requestAnimationFrame(done)));
+    r=e.getBoundingClientRect();
+    if (!inside()) return null;
+  }
+  return {x:r.x+r.width/2, y:r.y+r.height/2,
+          transparent:!e.checkVisibility({checkOpacity:true,checkVisibilityCSS:true})};
+})(%s)"""
+
+# Whether the pointer at (x, y) lands on the observed node, looking through shadow roots: the
+# document reports a shadow host for anything inside it, which would read every injected control
+# as covered. A transparent control is waited for first, since it is fading in under the hover.
+REACHES = """(async (action, x, y) => {
+  const e=window.__jevFast?.nodes.get(action.node);
+  if (!e?.isConnected) return 'gone';
+  for (let t=0; t<12 && !e.checkVisibility({checkOpacity:true,checkVisibilityCSS:true}); t++)
+    await new Promise(done=>setTimeout(done,50));
+  if (!e.checkVisibility({checkOpacity:true,checkVisibilityCSS:true})) return 'transparent';
+  let hit=document.elementFromPoint(x,y);
+  while (hit?.shadowRoot) {
+    const inner=hit.shadowRoot.elementFromPoint(x,y);
+    if (!inner || inner===hit) break;
+    hit=inner;
+  }
+  for (let n=hit; n; n=n.parentNode || n.host) if (n===e) return 'ok';
+  return 'covered';
+})(%s, %s, %s)"""
+
+# How far the pointer travels in a drag, and in how many moves. A pointer-driven drag library
+# starts dragging only past an activation distance, and a native drag starts only once the button
+# has moved while held; the moves are what both of them are waiting for.
+DRAG_STEPS = 12
+DRAG_PAUSE = 0.03
 
 
 class DaemonBusy(RuntimeError):
@@ -193,9 +278,30 @@ class Browser:
                 # The first document response is the page's own status; later ones are its frames.
                 faults.setdefault("document_status", response["status"])
         elif method == "Network.loadingFailed":
+            self.requests_open().pop(params.get("requestId"), None)
             faults.setdefault("requests", []).append({
                 "url": None, "status": None, "failed": (params.get("errorText") or "")[:80],
             })
+        if method == "Network.requestWillBeSent" and params.get("type") in FETCHES:
+            self.requests_open()[params.get("requestId")] = time.monotonic()
+        elif method == "Network.loadingFinished":
+            self.requests_open().pop(params.get("requestId"), None)
+
+    def requests_open(self):
+        """Fetches the page has started and not finished, by request id, with when each began."""
+        found = getattr(self, "open_requests", None)
+        if found is None:
+            found = self.open_requests = {}
+        return found
+
+    def pending(self):
+        """How many of the page's own fetches are still outstanding.
+
+        A request that has been open longer than LONG_REQUEST is a stream, a long poll or one that
+        hung, and the page is not waiting on it to draw anything, so it stops counting.
+        """
+        now = time.monotonic()
+        return sum(1 for began in self.requests_open().values() if now - began < LONG_REQUEST)
 
     def own_context(self):
         """A fresh browser context, or None where the browser will not make one."""
@@ -214,8 +320,14 @@ class Browser:
         self.call("Page.navigate", url=url)
         deadline = time.monotonic() + 15
         while time.monotonic() < deadline:
-            if self.evaluate("document.readyState") == "complete":
-                return
+            try:
+                if self.evaluate("document.readyState") == "complete":
+                    return
+            except (TimeoutError, StalePage):
+                # An app booting its bundle can hold the main thread past the transport's patience,
+                # and a document swapped mid-question answers nothing. Both mean not loaded yet;
+                # raising here ended runs before their first look, with nothing reported.
+                pass
             time.sleep(0.02)
 
     def frames(self):
@@ -319,6 +431,12 @@ class Browser:
                 if attempt == 9:
                     raise
                 time.sleep(0.02)
+            except TimeoutError:
+                # A page busy booting can hold a read past the transport's patience. Reading has no
+                # effect on the page, so it is asked again, as a document caught mid-swap is.
+                if attempt >= 3:
+                    raise
+                time.sleep(0.25)
         raise StalePage("Page did not settle")
 
     def worth_reading_frames(self, page):
@@ -390,7 +508,7 @@ class Browser:
         return [first] + self.frames()
 
     def fresh(self, page, action=None):
-        if action is not None and action["kind"] in {"click", "select"}:
+        if action is not None and action["kind"] in {"click", "select", "drag"}:
             node = action["node"]
             if type(node) is not int:
                 return False
@@ -405,6 +523,78 @@ class Browser:
         return self.evaluate(MARKER) == page["marker"]
 
     def settle(self, screenshot=False, timeout=None, previous=None, stabilise=False, glimpse=None):
+        """Observe until the page can be acted on, has stopped moving and has stopped arriving.
+
+        Stillness is `hold_still`. Arriving is a page still fetching, or still saying it is
+        loading, after it has gone still: the shell of a single-page app is both operable and still
+        while the list it was opened for is on its way. That second wait follows the same
+        transitions the first one does, so typing into a field never waits on a fetch.
+        """
+        started = time.monotonic()
+        page = self.hold_still(screenshot, timeout, previous, stabilise, glimpse)
+        if stabilise or previous is None or unsettling(previous, page):
+            page = self.arrive(page, screenshot, started)
+        return page
+
+    def arrive(self, page, screenshot, started):
+        """The page once its fetches have come back and it has stopped saying it is loading.
+
+        Bounded by SETTLE_BUSY from the start of the settle. A loading state that outlasts that is
+        a permanent one - a progress bar, a spinner in a corner - and is remembered as this page's
+        floor, so the next wait on the same page waits only for loading beyond it.
+        """
+        floors = getattr(self, "busy_floor", None)
+        if floors is None:
+            floors = self.busy_floor = {}
+        url = page.get("url")
+        floor = floors.get(url, 0)
+        deadline = started + SETTLE_BUSY
+        waited = False
+        while (page.get("busy", 0) > floor or self.pending()) and time.monotonic() < deadline:
+            waited = True
+            time.sleep(SETTLE_POLL * 2)
+            page = self.observe(screenshot=False, frames=False)
+        if page.get("busy", 0) > floor:
+            floors[url] = page["busy"]
+        if self.pending():
+            # Still open at the deadline, so not content on its way. Forgotten, so the next wait is
+            # not spent on the same request.
+            self.requests_open().clear()
+        if not waited:
+            return self.observe(screenshot=screenshot)
+        # What arrived is drawn in more than one pass, so it is given a moment to hold still.
+        quiet_by = min(deadline + SETTLE_STILL, time.monotonic() + 1.0)
+        while self.quiet_ms() < SETTLE_STILL * 1000 and time.monotonic() < quiet_by:
+            time.sleep(SETTLE_POLL)
+        return self.observe(screenshot=screenshot)
+
+    def usable(self, page):
+        """Whether a reading taken without its frames can be acted on.
+
+        The readings taken while waiting skip frames to stay cheap, so a page whose controls all
+        live in a frame - a site proxied into one, with a toolbar injected into it - reads as having
+        none, and every wait on it ran to its deadline. Its frames are looked into instead, at most
+        every FRAME_CHECK, and a page found to work that way is remembered as one that does.
+        """
+        if operable(page):
+            return True
+        url = page.get("url")
+        if getattr(self, "framed_url", None) == url:
+            return True
+        now = time.monotonic()
+        if now - getattr(self, "frame_checked", 0.0) < FRAME_CHECK:
+            return False
+        self.frame_checked = now
+        try:
+            whole = self.read(False, frames=True)
+        except StalePage:
+            return False
+        if operable(whole):
+            self.framed_url = url
+            return True
+        return False
+
+    def hold_still(self, screenshot=False, timeout=None, previous=None, stabilise=False, glimpse=None):
         """Observe until the page can be acted on, then wait for it to stop moving.
 
         Waiting for an operable page removes a wasted call: an empty action space can only be
@@ -423,7 +613,7 @@ class Browser:
             # A reading taken while waiting is enough to decide from. The wait governs when to act,
             # not when to start deciding.
             glimpse(page)
-        while not operable(page) and time.monotonic() < deadline:
+        while not self.usable(page) and time.monotonic() < deadline:
             # Whether anything can be acted on is a yes or no, not a window to wait out, so it is
             # asked as often as it is cheap to ask.
             time.sleep(SETTLE_POLL)
@@ -447,7 +637,7 @@ class Browser:
                 page = self.observe(screenshot=screenshot, frames=False)
                 if glimpse:
                     glimpse(page)
-                if operable(page) and (held is None or held["still"]):
+                if self.usable(page) and (held is None or held["still"]):
                     return self.observe(screenshot=screenshot)
             return self.observe(screenshot=screenshot)
         still_since = None
@@ -460,7 +650,7 @@ class Browser:
             # for a while, not once two reads happen to agree.
             still_since = (still_since or time.monotonic()) if following["fingerprint"] == page["fingerprint"] else None
             page = following
-            if operable(page) and (
+            if self.usable(page) and (
                 (still_since and time.monotonic() - still_since >= SETTLE_STILL)
                 or self.quiet_ms() >= SETTLE_STILL * 1000
             ):
@@ -533,7 +723,7 @@ class Browser:
                 settled = self.observe(screenshot=screenshot, frames=False)
                 if glimpse:
                     glimpse(settled)
-                return settled if operable(settled) else None
+                return settled if self.usable(settled) else None
             time.sleep(0.01)
         return None
 
@@ -603,6 +793,10 @@ class Browser:
         details = response.get("exceptionDetails")
         if details:
             thrown = (details.get("exception") or {}).get("description") or details.get("text") or "failed"
+            if "Illegal return statement" in str(thrown) and not expression.startswith("(async () => {"):
+                # Written as a function body, which is how a question with several statements comes
+                # out naturally. Run as one rather than failed for its form.
+                return self.ask("(async () => {\n" + expression + "\n})()", cap)
             return {"exception": str(thrown)[:cap]}
         value = response.get("result", {}).get("value")
         if isinstance(value, str):
@@ -628,7 +822,7 @@ class Browser:
             return 0.0
         return float(answer) if isinstance(answer, (int, float)) else 0.0
 
-    def act(self, action, page, text=None, insist=False):
+    def act(self, action, page, text=None, insist=False, drop=None):
         if not insist and not self.fresh(page, action):
             raise StalePage("Page changed since this decision. Observe again.")
         if action["kind"] == "wait":
@@ -640,9 +834,73 @@ class Browser:
             "offset": action.get("offset", (0.0, 0.0)),
             "action": action,
             "text": text,
+            "drop": drop,
         })
-        self.after_input = action if action["kind"] != "wait" else None
+        if action["kind"] == "drag":
+            self.drag(*result.pop("drag"))
+        self.after_input = action if action["kind"] not in {"wait", "drag"} else None
         return result
+
+    def drag(self, start, end):
+        """Press at `start`, travel to `end` and let go, as either kind of drag needs.
+
+        A pointer-driven library (dnd-kit, react-beautiful-dnd) follows the moves. A native drag
+        is begun by the browser once the held pointer moves, and with drags intercepted it is
+        handed back here instead of being run by the operating system, which is the only way a
+        native drag can be finished from the protocol: the drop is then dispatched to `end`.
+        Logged as executed by the caller before anything is observed, like any other input.
+        """
+        (sx, sy), (ex, ey) = start, end
+        mouse = lambda kind, x, y, **more: self.call("Input.dispatchMouseEvent", type=kind, x=x, y=y, **more)  # noqa: E731
+        try:
+            self.call("Input.setInterceptDrags", enabled=True)
+        except (RuntimeError, KeyError):
+            pass
+        intercepted = None
+        try:
+            mouse("mousePressed", sx, sy, button="left", buttons=1, clickCount=1)
+            for step in range(1, DRAG_STEPS + 1):
+                x, y = sx + (ex - sx) * step / DRAG_STEPS, sy + (ey - sy) * step / DRAG_STEPS
+                mouse("mouseMoved", x, y, button="left", buttons=1)
+                time.sleep(DRAG_PAUSE)
+                intercepted = intercepted or self.drag_started()
+                if intercepted:
+                    break
+            if intercepted:
+                for kind in ("dragEnter", "dragOver", "drop"):
+                    self.call("Input.dispatchDragEvent", type=kind, x=ex, y=ey, data=intercepted)
+                    time.sleep(DRAG_PAUSE)
+            mouse("mouseReleased", ex, ey, button="left", buttons=0, clickCount=1)
+        finally:
+            try:
+                self.call("Input.setInterceptDrags", enabled=False)
+            except (RuntimeError, KeyError):
+                pass
+
+    def drag_started(self):
+        """The data of a native drag the browser has handed back, if one has begun.
+
+        Read from the same event buffer as everything else, so what else is in it is passed on
+        rather than dropped.
+        """
+        try:
+            events = drain_events()
+        except (RuntimeError, OSError):
+            return None
+        found = None
+        for event in events:
+            method = event.get("method")
+            if method == "Input.dragIntercepted":
+                found = (event.get("params") or {}).get("data")
+            elif method == "Page.screencastFrame":
+                self.last_paint = time.monotonic()
+                try:
+                    self.call("Page.screencastFrameAck", sessionId=event["params"]["sessionId"])
+                except (RuntimeError, KeyError):
+                    pass
+            else:
+                self.note_fault(event)
+        return found
 
     def close(self):
         if getattr(self, "screencast", False):
@@ -747,34 +1005,73 @@ def browser_operation(request):
             # events, so the page does it, in page coordinates.
             return cdp(method, session_id=dispatch, **params)
 
+        def awaited(expression):
+            result = call("Runtime.evaluate", expression=expression, returnByValue=True, awaitPromise=True)
+            if result.get("exceptionDetails"):
+                raise StalePage("Document changed during evaluation")
+            return result.get("result", {}).get("value")
+
         if kind == "scroll":
             send("Input.dispatchMouseEvent", type="mouseWheel", x=550, y=650, deltaX=0, deltaY=action["delta"])
+        elif kind == "select":
+            if type(action["node"]) is not int:
+                raise ValueError("Invalid observed node")
+            # Set in the page rather than through the pointer: a native dropdown opens a list the
+            # page cannot see, and the change it makes is the same. Reachability is checked in the
+            # same evaluation as the change, so an interruption can never be mistaken for one that
+            # happened before anything was set.
+            done = evaluate("""(action => {
+              const e=window.__jevFast?.nodes.get(action.node);
+              if (!e?.isConnected || e.tagName!=='SELECT' || e.disabled ||
+                  !e.checkVisibility({checkOpacity:true,checkVisibilityCSS:true}) ||
+                  ![...e.options].some(o=>o.value===action.value && !o.disabled && !o.closest('optgroup[disabled]')))
+                return null;
+              let r=e.getBoundingClientRect();
+              const inside=()=>r.width && r.height && r.x+r.width/2>=0 && r.y+r.height/2>=0 &&
+                r.x+r.width/2<innerWidth && r.y+r.height/2<innerHeight;
+              if (!inside()) { e.scrollIntoView({block:'center'}); r=e.getBoundingClientRect(); }
+              if (!inside()) return null;
+              let hit=document.elementFromPoint(r.x+r.width/2,r.y+r.height/2);
+              while (hit?.shadowRoot) {
+                const inner=hit.shadowRoot.elementFromPoint(r.x+r.width/2,r.y+r.height/2);
+                if (!inner || inner===hit) break;
+                hit=inner;
+              }
+              let reached=false;
+              for (let n=hit; n; n=n.parentNode || n.host) if (n===e) reached=true;
+              if (!reached) return null;
+              e.value=action.value;
+              e.dispatchEvent(new Event('input',{bubbles:true}));
+              e.dispatchEvent(new Event('change',{bubbles:true}));
+              return true;
+            })(""" + json.dumps(action) + ")")
+            if done is None:
+                raise RuntimeError("Dropdown execution was not confirmed; inspect before retrying.")
         elif kind != "wait":
             if type(action["node"]) is not int:
                 raise ValueError("Invalid observed node")
             # Code-owned node IDs refer to actual observed elements, never model-generated selectors.
-            target = evaluate("""(action => {
-              const e=window.__jevFast?.nodes.get(action.node);
-              if (!e?.isConnected || e.matches(':disabled') || e.closest('[aria-disabled="true"],[inert]') ||
-                  !e.checkVisibility({checkOpacity:true,checkVisibilityCSS:true})) return null;
-              if (action.kind==='fill' && (e.readOnly || e.getAttribute('aria-readonly')==='true')) return null;
-              const r=e.getBoundingClientRect(), x=r.x+r.width/2, y=r.y+r.height/2;
-              if (!r.width || !r.height || x<0 || y<0 || x>=innerWidth || y>=innerHeight) return null;
-              if (!e.contains(document.elementFromPoint(x,y))) return null;
-              if (action.kind==='select') {
-                if (e.tagName!=='SELECT' || ![...e.options].some(o=>o.value===action.value &&
-                    !o.disabled && !o.closest('optgroup[disabled]'))) return null;
-                e.value=action.value;
-                e.dispatchEvent(new Event('input',{bubbles:true}));
-                e.dispatchEvent(new Event('change',{bubbles:true}));
-              }
-              return {x,y};
-            })(""" + json.dumps(action) + ")")
+            target = awaited(LOCATE % json.dumps(action))
             if target is None:
-                if kind == "select":
-                    raise RuntimeError("Dropdown execution was not confirmed; inspect before retrying.")
-                raise StalePage("Target changed or is covered. Observe again.")
-            if kind != "select":
+                raise StalePage("Target changed or is out of reach. Observe again.")
+            # The pointer arrives before it presses, as a person's does. A control revealed on hover
+            # appears only then, and a page that tracks the pointer to place what a click makes
+            # places it where the pointer last was.
+            send("Input.dispatchMouseEvent", type="mouseMoved", x=target["x"] + dx, y=target["y"] + dy)
+            reached = awaited(REACHES % (json.dumps(action), target["x"], target["y"]))
+            if reached != "ok":
+                raise Covered(f"Target is {reached}; nothing was sent. Observe again.", action)
+            if kind == "drag":
+                zone = request.get("drop")
+                if not zone or zone.get("session", session) != action.get("session", session):
+                    raise ValueError("A drag needs a drop zone in the same frame")
+                end = awaited(LOCATE % json.dumps({**zone, "kind": "click"}))
+                if end is None:
+                    raise StalePage("Drop zone changed or is out of reach. Observe again.")
+                return {"executed": action["id"], "drag": [
+                    (target["x"] + dx, target["y"] + dy), (end["x"] + dx, end["y"] + dy),
+                ]}
+            if kind == "click" or kind == "fill":
                 x, y = target["x"] + dx, target["y"] + dy
                 for event in ("mousePressed", "mouseReleased"):
                     send("Input.dispatchMouseEvent", type=event, x=x, y=y, button="left", clickCount=1)

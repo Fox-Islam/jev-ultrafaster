@@ -1130,3 +1130,159 @@ def test_freeing_a_worker_closes_its_page_and_gives_back_the_daemon(monkeypatch)
     assert runner.free() == {"target": True, "context": True}
     assert runner.handle is None
     runner.browser.release.assert_called_once()
+
+
+def test_a_refused_control_stops_being_offered(runner):
+    covered = {"id": "e3", "kind": "click", "label": "Go", "node": 20}
+
+    class Refusing(loop.Agent):
+        def command(self, name, body=None):
+            if name == "predict":
+                raise loop.Covered("Target is covered", covered)
+            return super().command(name, body)
+
+    agent = Refusing.__new__(Refusing)
+    agent.__dict__.update(runner.__dict__)
+    agent.command("tick")
+    assert agent.fixated() == set()  # one refusal can be a menu still closing
+    agent.command("tick")
+    assert agent.fixated() == {("Go", "click")}
+
+
+def test_an_executed_action_clears_the_refusals(runner):
+    runner.refused = {("Learn more", "click"): 2}
+    runner.state["decision"] = {**decision("e3"), "operation": "CLICK"}
+    runner.state["browser"].act = Mock()
+    runner.command("act", {"fingerprint": runner.state["page"]["fingerprint"]})
+    assert runner.refused == {}
+
+
+def test_done_is_withheld_while_tracked_steps_are_unfinished(monkeypatch):
+    sent = {}
+
+    def post(_url, _key, body):
+        sent.update(body)
+        offered = body["questions"]["operation"]["criteria"]
+        return {"model": "test", "answers": {
+            "operation": choice(offered, next(iter(offered))),
+            "type_text_target": choice(["1"], "1"),
+            "click_target": choice(["1", "2"], "1"),
+        }}
+
+    monkeypatch.setenv("TYPESAFE_API_KEY", "test")
+    monkeypatch.setattr(model, "post_json", post)
+    model.choose(page(), "Submit the form", [], ["Submit the form"], (), False)
+    assert "DONE" not in sent["questions"]["operation"]["criteria"]
+    model.choose(page(), "Submit the form", [], [], (), True)
+    assert "DONE" in sent["questions"]["operation"]["criteria"]
+
+
+def test_a_low_confidence_done_is_reported_doubtful(runner):
+    runner.state["decision"] = {**decision("DONE"), "choice": "DONE", "operation": "DONE", "confidence": 0.21}
+    runner.state["plan"] = ["Submit"]
+    runner.unfresh_since = None
+    out = runner.command("act", {"fingerprint": runner.state["page"]["fingerprint"]})
+    assert out["status"] == "done" and out["doubtful"] is True
+
+
+def test_a_drag_names_where_it_ends(monkeypatch):
+    actions = [
+        {"id": "e1", "kind": "drag", "label": "Task seven", "role": "draggable", "node": 1},
+        {"id": "e2", "kind": "drop", "label": "Done column", "role": "drop zone", "node": 2},
+        {"id": "e3", "kind": "drop", "label": "Archive", "role": "drop zone", "node": 3},
+        {"id": "e4", "kind": "click", "label": "Settings", "role": "button", "node": 4},
+    ]
+    state = {"url": "https://example.test/", "title": "Board", "text": "", "scroll": {"y": 0}, "actions": actions}
+    elements, targets, _ = model.action_space(actions)
+    assert "DRAG" in targets and all(e["label"] != "Done column" for e in elements)
+
+    def post(_url, _key, body):
+        assert "drop_zone" in body["questions"]
+        return {"model": "test", "answers": {
+            "operation": choice(body["questions"]["operation"]["criteria"], "DRAG"),
+            "drop_zone": choice(["1", "2"], "2"),
+        }}
+
+    monkeypatch.setenv("TYPESAFE_API_KEY", "test")
+    monkeypatch.setattr(model, "post_json", post)
+    chosen = model.choose(state, "Archive task seven", [])
+    assert chosen["choice"] == "e1" and chosen["drop"] == "e3"
+
+
+def test_a_drag_with_nowhere_to_go_is_not_offered():
+    actions = [{"id": "e1", "kind": "drag", "label": "Task", "node": 1}]
+    assert model.drop_zones(actions) == {}
+
+
+def test_a_read_only_run_cannot_drag():
+    actions = [{"id": "e1", "kind": "drag", "label": "Task", "node": 1},
+               {"id": "e2", "kind": "drop", "label": "Archive", "node": 2}]
+    assert model.readable_only(actions) == []
+
+
+def test_a_held_drag_is_never_reused(runner):
+    runner.held = {0: {"operation": "DRAG", "label": "Go", "kind": "click", "confidence": 0.9}}
+    assert runner.reuse_held([0]) is None
+
+
+def test_a_drag_is_scripted_with_its_drop_and_counts_as_mutating():
+    state = {"url": "https://example.test/", "goal": "Archive it",
+             "history": [{"kind": "drag", "action": "Task seven", "drop": "Archive"}]}
+    document = replay_module.script(state)
+    assert document["steps"][0] == {"kind": "drag", "label": "Task seven", "drop": "Archive"}
+    assert replay_module.mutates(document) is True
+
+
+def test_hover_and_offscreen_controls_are_described():
+    text = model.describe_target("1", {"label": "Remove file", "role": "button", "hover": True, "offscreen": "panel"})
+    assert "shown when hovered" in text and "scrolling panel" in text
+
+
+def test_a_function_body_query_is_run_as_one(monkeypatch):
+    b = browser_module.Browser.__new__(browser_module.Browser)
+    b.session = "test"
+    sent = []
+
+    def cdp(_method, **params):
+        sent.append(params["expression"])
+        if len(sent) == 1:
+            return {"exceptionDetails": {"exception": {"description": "SyntaxError: Illegal return statement"}}}
+        return {"result": {"value": 3}}
+
+    monkeypatch.setattr(browser_module, "cdp", cdp)
+    assert b.ask("const n = 3; return n") == {"value": 3}
+    assert sent[1].startswith("(async () => {")
+
+
+def test_a_stopped_run_answers_every_question():
+    runner = loop.Agent.__new__(loop.Agent)
+    runner.asked = [{"query": "why", "after": 2}]
+    runner.answered, runner.plan_satisfied = {}, set()
+    state = {"plan": ["a", "b"], "status": "blocked", "browser": Mock(ask=Mock(return_value={"value": "here"}))}
+    runner.ask_due(state)
+    assert state["queries"] == [{"value": "here"}]
+
+
+def test_open_fetches_count_until_they_finish_or_turn_out_long(monkeypatch):
+    b = browser_module.Browser.__new__(browser_module.Browser)
+    clock = [100.0]
+    monkeypatch.setattr(browser_module.time, "monotonic", lambda: clock[0])
+    b.note_fault({"method": "Network.requestWillBeSent", "params": {"requestId": "1", "type": "Fetch"}})
+    b.note_fault({"method": "Network.requestWillBeSent", "params": {"requestId": "2", "type": "XHR"}})
+    b.note_fault({"method": "Network.requestWillBeSent", "params": {"requestId": "3", "type": "Image"}})
+    assert b.pending() == 2
+    b.note_fault({"method": "Network.loadingFinished", "params": {"requestId": "1"}})
+    assert b.pending() == 1
+    clock[0] += browser_module.LONG_REQUEST + 1
+    assert b.pending() == 0  # a stream or a hung call, not content on its way
+
+
+def test_a_page_whose_controls_are_in_frames_counts_as_usable(monkeypatch):
+    b = browser_module.Browser.__new__(browser_module.Browser)
+    bare = {"url": "https://app.test/collaborate", "actions": [{"id": "wait", "kind": "wait"}]}
+    framed = {"url": bare["url"], "actions": [{"id": "1:e1", "kind": "click", "label": "Filter", "node": 1}]}
+    reads = []
+    b.read = lambda screenshot, frames=True: reads.append(frames) or framed
+    assert b.usable(bare) is True
+    assert b.usable(bare) is True
+    assert reads == [True]  # remembered, not read again on every poll
