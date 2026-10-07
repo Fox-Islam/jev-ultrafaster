@@ -88,6 +88,7 @@ class Agent:
             status="ready",
             evidence=None,
             reason=None,
+            unconfirmed=[],
             plan=plan,
             plan_index=0,
             decisions=[],
@@ -169,8 +170,6 @@ class Agent:
                 state["history"],
                 [state["plan"][i] for i in outstanding],
                 self.fixated(),
-                # With steps tracked, finishing is their checks agreeing; see `choose`.
-                not outstanding,
             )
             ahead = self.take_guess(state["page"]["fingerprint"]) if self.guessing_ahead() else None
             if ahead is not None:
@@ -215,6 +214,14 @@ class Agent:
                 state["elapsed_ms"] = round((time.perf_counter() - state["started_at"]) * 1000)
                 return self.snapshot()
             selected = decision["choice"]
+            if selected == "DONE" and self.unsatisfied():
+                if not self.settled_or_restless(page):
+                    state["status"] = "ready"
+                    raise StalePage("Page changed since the decision. Choose again.")
+                decision = self.double_check(page)
+                selected = decision["choice"]
+                if selected == "DONE":
+                    state["unconfirmed"] = self.unsatisfied()
             if selected in {"DONE", "BLOCKED"}:
                 if not self.settled_or_restless(page):
                     state["status"] = "ready"
@@ -335,6 +342,34 @@ class Agent:
         else:
             raise ValueError("Unknown command")
         return self.snapshot()
+
+    def unsatisfied(self):
+        """Tracked sub-goals not yet read as satisfied, in plan order."""
+        plan = self.state["plan"]
+        if not getattr(self, "track_plan", False) or len(plan) < 2:
+            return []
+        return [index for index in range(len(plan)) if index not in self.plan_satisfied]
+
+    def double_check(self, page):
+        """One more decision, taken with the first unsatisfied sub-goal as the goal.
+
+        DONE arrived while a tracked sub-goal reads unsatisfied. Satisfaction readings are too
+        noisy to overrule DONE, and withholding DONE until they agree stops runs blocked that did
+        finish: a submit that only closes its form never reads as sent. Asking about that one
+        sub-goal either finds the action it still needs or answers DONE again, and a second DONE
+        stands, with the sub-goals never confirmed recorded for the caller.
+        """
+        state = self.state
+        checked = choose(page, state["plan"][self.unsatisfied()[0]], state["history"], [], self.fixated())
+        state["decisions"].append(
+            {
+                **checked,
+                "double_check": True,
+                "fingerprint": page["fingerprint"],
+                "elapsed_ms": round((time.perf_counter() - state["started_at"]) * 1000),
+            }
+        )
+        return checked
 
     def off_site(self, page):
         """Whether this page is outside the hosts the run was allowed."""

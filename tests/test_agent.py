@@ -1157,25 +1157,6 @@ def test_an_executed_action_clears_the_refusals(runner):
     assert runner.refused == {}
 
 
-def test_done_is_withheld_while_tracked_steps_are_unfinished(monkeypatch):
-    sent = {}
-
-    def post(_url, _key, body):
-        sent.update(body)
-        offered = body["questions"]["operation"]["criteria"]
-        return {"model": "test", "answers": {
-            "operation": choice(offered, next(iter(offered))),
-            "type_text_target": choice(["1"], "1"),
-            "click_target": choice(["1", "2"], "1"),
-        }}
-
-    monkeypatch.setenv("TYPESAFE_API_KEY", "test")
-    monkeypatch.setattr(model, "post_json", post)
-    model.choose(page(), "Submit the form", [], ["Submit the form"], (), False)
-    assert "DONE" not in sent["questions"]["operation"]["criteria"]
-    model.choose(page(), "Submit the form", [], [], (), True)
-    assert "DONE" in sent["questions"]["operation"]["criteria"]
-
 
 def test_a_low_confidence_done_is_reported_doubtful(runner):
     runner.state["decision"] = {**decision("DONE"), "choice": "DONE", "operation": "DONE", "confidence": 0.21}
@@ -1286,3 +1267,52 @@ def test_a_page_whose_controls_are_in_frames_counts_as_usable(monkeypatch):
     assert b.usable(bare) is True
     assert b.usable(bare) is True
     assert reads == [True]  # remembered, not read again on every poll
+
+
+def done_decision(confidence=0.9):
+    return {**decision("DONE"), "choice": "DONE", "operation": "DONE", "confidence": confidence}
+
+
+@pytest.fixture
+def tracked(runner):
+    runner.track_plan = True
+    runner.plan_satisfied = {0}
+    runner.unfresh_since = None
+    runner.refused = {}
+    runner.state["plan"] = ["Open the form", "Send the new task"]
+    runner.state["decision"] = done_decision()
+    return runner
+
+
+def test_done_with_an_unsatisfied_step_asks_once_about_that_step(tracked, monkeypatch):
+    asked = []
+    monkeypatch.setattr(loop, "choose", lambda page, goal, history, pending, suppress: asked.append(
+        (goal, pending)) or done_decision())
+    out = tracked.command("act", {"fingerprint": tracked.state["page"]["fingerprint"]})
+    assert asked == [("Send the new task", [])]
+    assert out["status"] == "done" and out["unconfirmed"] == [1]
+    assert tracked.state["decisions"][-1]["double_check"] is True
+
+
+def test_a_double_check_that_finds_an_action_takes_it(tracked, monkeypatch):
+    monkeypatch.setattr(loop, "choose", lambda *a: {**decision("e3"), "operation": "CLICK"})
+    tracked.state["browser"].act = Mock()
+    out = tracked.command("act", {"fingerprint": tracked.state["page"]["fingerprint"]})
+    assert out["status"] == "ready" and not out.get("unconfirmed")
+    assert tracked.state["browser"].act.call_args.args[0]["id"] == "e3"
+
+
+def test_a_double_check_that_answers_blocked_stops_blocked(tracked, monkeypatch):
+    monkeypatch.setattr(loop, "choose", lambda *a: {**decision("BLOCKED"), "choice": "BLOCKED", "operation": "BLOCKED"})
+    out = tracked.command("act", {"fingerprint": tracked.state["page"]["fingerprint"]})
+    assert out["status"] == "blocked"
+
+
+@pytest.mark.parametrize("track_plan,satisfied", [(True, {0, 1}), (False, set())])
+def test_done_without_an_unsatisfied_tracked_step_ends_at_once(tracked, monkeypatch, track_plan, satisfied):
+    tracked.track_plan, tracked.plan_satisfied = track_plan, satisfied
+    chosen = Mock()
+    monkeypatch.setattr(loop, "choose", chosen)
+    out = tracked.command("act", {"fingerprint": tracked.state["page"]["fingerprint"]})
+    assert out["status"] == "done"
+    chosen.assert_not_called()

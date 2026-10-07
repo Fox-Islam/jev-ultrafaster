@@ -242,7 +242,7 @@ def scrolling_still_helps(state, history):
     return not down or down[-1].get("page_changed") is not False
 
 
-def choose(state, goal, history, pending=(), suppress=(), allow_done=True):
+def choose(state, goal, history, pending=(), suppress=()):
     elements, targets, controls = action_space(state["actions"])
     zones = drop_zones(state["actions"])
     if not zones:
@@ -267,11 +267,6 @@ def choose(state, goal, history, pending=(), suppress=(), allow_done=True):
     operations = {key: labels[key] for key in targets}
     operations.update({key: value["label"] for key, value in controls.items()})
     operations.update(DONE="Every requirement is visibly satisfied.", BLOCKED="No supported operation can progress.")
-    if not allow_done:
-        # Steps are being checked one by one and some read unfinished, so finishing is decided by
-        # those checks agreeing, never by one broad judgement that the page looks done. That
-        # judgement is what answered DONE at 0.21 with the form it was meant to submit closed.
-        operations.pop("DONE")
     rules = [NEXT_ACTION]
     if scrolling_still_helps(state, history):
         # Withheld rather than argued against, the way a control that stopped moving the page is:
