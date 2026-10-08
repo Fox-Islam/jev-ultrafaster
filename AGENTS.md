@@ -49,6 +49,8 @@ host limits, page diagnostics and replay exist for that caller, not for a person
   gives each process its own daemon, stopped at exit, for runs side by side.
 - Every run gets its own browser context, disposed at close, so one customer's cookies and logins
   do not reach the next.
+- An open browser closes itself at exit and on SIGTERM/SIGINT, then ends the way the process
+  would have. A kept page (`keep_open_s`, `Browser.keep`) is left for its handle's holder.
 - `keep_open_s` leaves the page open and puts a handle in the result. The caller keeps the
   registry; jev keeps no timer. `session.close_handle` works from another process and is a no-op
   when the page is already gone. `Agent.free` closes the page and gives the daemon back.

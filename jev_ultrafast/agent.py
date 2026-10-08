@@ -115,6 +115,8 @@ class Agent:
             # Made when the run stops, not when it is closed: a caller reads the result before
             # closing, and a handle that appears afterwards is a handle it never sees.
             self.handle = session.handle_for(browser)
+            if hasattr(browser, "keep"):
+                browser.keep()  # the handle's holder closes it, possibly after this process ends
         faults = getattr(self.state.get("browser"), "faults", None)
         return {
             **{k: v for k, v in self.state.items() if k != "browser"},

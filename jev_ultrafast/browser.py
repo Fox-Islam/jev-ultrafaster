@@ -4,6 +4,7 @@ import atexit
 import hashlib
 import json
 import os
+import signal
 import sys
 import threading
 import time
@@ -276,7 +277,8 @@ class Browser:
             else:
                 self.open(url, context, watching=os.environ.get("JEV_FOREGROUND") == "1")
         except BaseException:
-            self.release()
+            # Whatever was made before the failure - a context, a tab - goes with it.
+            self.close()
             raise
 
     @classmethod
@@ -291,6 +293,7 @@ class Browser:
 
     def open(self, url, context, watching):
         ensure_own_daemon()
+        self.guard_exit()
         # Background by default so a run does not steal the window. JEV_FOREGROUND=1 brings it to
         # the front instead, for watching a run live.
         # A run gets its own browser context, so the cookies and logins of the site before it do
@@ -321,6 +324,7 @@ class Browser:
         drawing menus and animation frames otherwise; it belongs to this session and ends with it.
         """
         ensure_own_daemon()
+        self.guard_exit()
         self.borrowed = True
         self.context = None
         self.target = target
@@ -333,6 +337,50 @@ class Browser:
             pass
         self.faults = {}
         self.watch_faults()
+
+    def guard_exit(self):
+        """Close this browser when the process ends without closing it.
+
+        A run is often bounded from outside, by `timeout` or a supervisor, and SIGTERM ends a
+        process without unwinding it: no `with` block exits and no `finally` runs, so the tab and
+        its context stayed open in the shared browser after every run that was cut short. Closing
+        is idempotent and knows a borrowed page from an owned one, so it is safe to run from here.
+        """
+        atexit.register(self.close)
+        self.handlers = {}
+        if threading.current_thread() is not threading.main_thread():
+            return  # signal handlers can only be set from the main thread
+        for signum in (signal.SIGTERM, signal.SIGINT):
+            try:
+                self.handlers[signum] = signal.signal(signum, self.on_signal)
+            except (ValueError, OSError):
+                pass
+
+    def unguard_exit(self):
+        """Stop closing this browser at exit. Called on close, and when the page is handed on."""
+        atexit.unregister(self.close)
+        for signum, previous in (getattr(self, "handlers", None) or {}).items():
+            try:
+                if signal.getsignal(signum) == self.on_signal:
+                    signal.signal(signum, previous)
+            except (ValueError, OSError):
+                pass
+        self.handlers = {}
+
+    def on_signal(self, signum, frame):
+        """Close, then end the way the process would have ended without this handler."""
+        previous = (getattr(self, "handlers", None) or {}).get(signum)
+        self.close()
+        if previous is signal.SIG_IGN:
+            return
+        if callable(previous):
+            previous(signum, frame)  # SIGINT's own handler raises KeyboardInterrupt
+            return
+        raise SystemExit(128 + signum)
+
+    def keep(self):
+        """Leave the page open when this process ends: someone else holds it now."""
+        self.unguard_exit()
 
     def release(self):
         """Give the daemon back. Idempotent, so closing twice is not an error."""
@@ -1009,6 +1057,7 @@ class Browser:
         return found
 
     def close(self):
+        self.unguard_exit()
         if getattr(self, "screencast", False):
             # A page outlives the reader that started the report, and Chrome refuses a second
             # screencast on a target that already has one.
@@ -1033,8 +1082,11 @@ class Browser:
             self.target = None  # leave the page up to be looked at
             self.release()
             return
-        if self.target:
-            cdp("Target.closeTarget", targetId=self.target)
+        if getattr(self, "target", None):
+            try:
+                cdp("Target.closeTarget", targetId=self.target)
+            except (RuntimeError, KeyError):
+                pass  # already gone, and this may be running on the way out of a failure
             self.target = None
         if getattr(self, "context", None):
             # Disposing takes the context's cookies and storage with it.

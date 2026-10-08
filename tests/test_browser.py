@@ -174,3 +174,101 @@ def test_a_daemon_per_run_is_named_for_this_process():
     ).stdout.split()
     pid, name, daemon, per_run = shown
     assert name == daemon and name.startswith(f"jev-{pid}-") and per_run == "True"
+
+
+# A run that opens a page against a fake daemon, writes each CDP method it sends to a file, and
+# then waits to be ended. How it ends is the argument.
+RUN = """
+import json, sys
+from jev_ultrafast import browser
+sent = open(sys.argv[1], "a")
+answers = {"Target.createBrowserContext": {"browserContextId": "C1"}, "Target.createTarget": {"targetId": "T-new"},
+           "Target.attachToTarget": {"sessionId": "S1"}}
+def cdp(method, session_id=None, **params):
+    sent.write(method + "\\n"); sent.flush()
+    if method == "Runtime.evaluate":
+        return {"result": {"value": "complete" if params["expression"] == "document.readyState" else [800, 600]}}
+    return answers.get(method, {})
+browser.cdp = cdp
+browser.ensure_daemon = lambda: None
+held = browser.Browser.attach("T-mine") if sys.argv[2] == "attach" else browser.Browser("https://example.test/")
+if sys.argv[3] == "keep":
+    held.keep()
+print("open", flush=True)
+if sys.argv[3] != "exit":
+    sys.stdin.read()
+"""
+
+
+def run(tmp_path, how="open", end="wait"):
+    log = tmp_path / "sent.log"
+    env = {**os.environ, "XDG_CACHE_HOME": str(tmp_path), "BU_NAME": "jev-test-exit"}
+    for name in ("JEV_DAEMON_PER_RUN", "JEV_KEEP_OPEN", "JEV_BROWSER_CONTEXT"):
+        env.pop(name, None)
+    child = subprocess.Popen([sys.executable, "-c", RUN, str(log), how, end],
+                             stdin=subprocess.PIPE, stdout=subprocess.PIPE, text=True, env=env)
+    assert child.stdout.readline().strip() == "open"
+    return child, log
+
+
+def sent_by(log):
+    return log.read_text().split()
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="SIGTERM")
+def test_a_terminated_run_closes_its_page_and_context(tmp_path):
+    child, log = run(tmp_path)
+    child.send_signal(signal.SIGTERM)
+    child.communicate(timeout=30)
+    assert child.returncode == 128 + signal.SIGTERM
+    assert "Target.closeTarget" in sent_by(log) and "Target.disposeBrowserContext" in sent_by(log)
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="SIGINT")
+def test_an_interrupted_run_closes_its_page_and_still_raises(tmp_path):
+    child, log = run(tmp_path)
+    child.send_signal(signal.SIGINT)
+    child.communicate(timeout=30)
+    assert child.returncode != 0  # KeyboardInterrupt, as without the handler
+    assert "Target.closeTarget" in sent_by(log)
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="SIGTERM")
+def test_a_terminated_run_in_an_attached_page_only_detaches(tmp_path):
+    child, log = run(tmp_path, how="attach")
+    child.send_signal(signal.SIGTERM)
+    child.communicate(timeout=30)
+    assert "Target.detachFromTarget" in sent_by(log)
+    assert "Target.closeTarget" not in sent_by(log)
+
+
+def test_a_run_that_exits_without_closing_still_closes(tmp_path):
+    child, log = run(tmp_path, end="exit")
+    child.communicate(timeout=30)
+    assert child.returncode == 0
+    assert sent_by(log).count("Target.closeTarget") == 1
+
+
+def test_a_kept_page_outlives_the_process(tmp_path):
+    child, log = run(tmp_path, end="keep")
+    child.communicate(input="", timeout=30)
+    assert "Target.closeTarget" not in sent_by(log)
+
+
+def test_closing_hands_the_signals_back(sent):
+    before = signal.getsignal(signal.SIGTERM)
+    browser = browser_module.Browser("https://example.test/")
+    assert signal.getsignal(signal.SIGTERM) == browser.on_signal
+    browser.close()
+    assert signal.getsignal(signal.SIGTERM) == before
+
+
+def test_a_failed_open_closes_what_it_made(sent, monkeypatch):
+    def navigate(self, url):
+        raise RuntimeError("navigation refused")
+
+    monkeypatch.setattr(browser_module.Browser, "navigate", navigate)
+    with pytest.raises(RuntimeError):
+        browser_module.Browser("https://example.test/")
+    assert ("Target.closeTarget", {"targetId": "T-new"}) in sent
+    assert ("Target.disposeBrowserContext", {"browserContextId": "C1"}) in sent
