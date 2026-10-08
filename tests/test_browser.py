@@ -272,3 +272,49 @@ def test_a_failed_open_closes_what_it_made(sent, monkeypatch):
         browser_module.Browser("https://example.test/")
     assert ("Target.closeTarget", {"targetId": "T-new"}) in sent
     assert ("Target.disposeBrowserContext", {"browserContextId": "C1"}) in sent
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="SIGCHLD")
+def test_stopping_the_own_daemon_lets_the_system_collect_it(monkeypatch):
+    seen = []
+    monkeypatch.setattr(browser_module, "restart_daemon", lambda name: seen.append(signal.getsignal(signal.SIGCHLD)))
+    before = signal.getsignal(signal.SIGCHLD)
+    browser_module.stop_own_daemon()
+    assert seen == [signal.SIG_IGN]
+    assert signal.getsignal(signal.SIGCHLD) == before
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="SIGCHLD")
+def test_the_daemon_stop_restores_the_handler_when_it_fails(monkeypatch):
+    def fail(name):
+        raise RuntimeError("stuck")
+
+    monkeypatch.setattr(browser_module, "restart_daemon", fail)
+    before = signal.getsignal(signal.SIGCHLD)
+    browser_module.stop_own_daemon()
+    assert signal.getsignal(signal.SIGCHLD) == before
+
+
+def test_a_per_run_lock_file_goes_when_the_browser_does(sent, monkeypatch, tmp_path):
+    monkeypatch.setattr(browser_module, "PER_RUN", True)
+    browser_module.Browser.attach("T-mine").close()
+    assert list(tmp_path.glob("*.lock")) == []
+
+
+def test_the_shared_lock_file_stays(sent, tmp_path):
+    browser_module.Browser.attach("T-mine").close()
+    assert [p.name for p in tmp_path.glob("*.lock")] == [f"{browser_module.DAEMON}.lock"]
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="SIGTERM")
+def test_a_per_run_lock_file_goes_when_the_run_is_terminated(tmp_path):
+    env = {**os.environ, "XDG_CACHE_HOME": str(tmp_path), "BU_NAME": "jev-test-perrun"}
+    env["JEV_DAEMON_PER_RUN"] = "1"
+    code = RUN.replace("browser.ensure_daemon = lambda: None", "browser.ensure_own_daemon = lambda: None")
+    child = subprocess.Popen([sys.executable, "-c", code, str(tmp_path / "s.log"), "attach", "wait"],
+                             stdin=subprocess.PIPE, stdout=subprocess.PIPE, text=True, env=env)
+    assert child.stdout.readline().strip() == "open"
+    assert list((tmp_path / "jev").glob("*.lock"))
+    child.send_signal(signal.SIGTERM)
+    child.wait(timeout=30)
+    assert list((tmp_path / "jev").glob("*.lock")) == []

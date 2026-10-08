@@ -209,10 +209,14 @@ LOCKS = Path(os.environ.get("XDG_CACHE_HOME") or Path.home() / ".cache") / "jev"
 PER_RUN = os.environ.get("JEV_DAEMON_PER_RUN") == "1"
 
 
+def lock_path(name=None):
+    return LOCKS / f"{name or DAEMON}.lock"
+
+
 def claim_daemon(name=None):
     """An exclusive hold on the daemon across processes, or None when another process has it."""
     LOCKS.mkdir(parents=True, exist_ok=True)
-    held = open(LOCKS / f"{name or DAEMON}.lock", "a+")
+    held = open(lock_path(name), "a+")
     try:
         if sys.platform == "win32":
             import msvcrt
@@ -242,11 +246,26 @@ def let_go(held):
 
 
 def stop_own_daemon():
-    """Stop the daemon this process was given. Best effort: the process is leaving either way."""
+    """Stop the daemon this process was given. Best effort: the process is leaving either way.
+
+    The daemon is this process's child, and a child that has exited stays in the process table
+    until its parent collects it. The harness waits for the daemon to be gone by signalling its pid,
+    which still succeeds for that leftover entry, so it waited its full 15 s every time. Ignoring
+    SIGCHLD while it stops lets the system collect the child as it exits.
+    """
+    previous = None
+    if hasattr(signal, "SIGCHLD"):
+        try:
+            previous = signal.signal(signal.SIGCHLD, signal.SIG_IGN)
+        except (ValueError, OSError):
+            pass
     try:
         restart_daemon(DAEMON)
     except Exception:
         pass
+    finally:
+        if previous is not None:
+            signal.signal(signal.SIGCHLD, previous)
 
 
 def ensure_own_daemon():
@@ -389,6 +408,8 @@ class Browser:
             if getattr(self, "daemon_lock", None) is not None:
                 let_go(self.daemon_lock)
                 self.daemon_lock = None
+                if PER_RUN:
+                    lock_path().unlink(missing_ok=True)  # named for this process, so nothing reuses it
             IN_USE.release()
 
     def watch_faults(self):
