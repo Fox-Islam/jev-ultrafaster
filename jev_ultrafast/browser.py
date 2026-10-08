@@ -1,5 +1,6 @@
 """Observed actions through Browser Harness; one CDP session, no per-step subprocess."""
 
+import atexit
 import hashlib
 import json
 import os
@@ -8,7 +9,8 @@ import threading
 import time
 from pathlib import Path
 
-from browser_harness.admin import ensure_daemon
+from browser_harness.admin import ensure_daemon, restart_daemon
+from browser_harness.helpers import NAME as DAEMON
 from browser_harness.helpers import cdp, drain_events
 
 # Atomically read visible content and controls, preserving actual DOM node identity.
@@ -194,6 +196,64 @@ class DaemonBusy(RuntimeError):
 # in the protocol prevents that, so it is refused here.
 IN_USE = threading.Lock()
 
+# The lock above holds within one process and no further, and every process on the machine reaches
+# the same daemon by name (BU_NAME, "default" unless set). Two runs started side by side shared one
+# event buffer and each took the other's events without either knowing. A lock on a file named for
+# the daemon holds across processes, and the operating system lets go of it when its holder dies,
+# so a run that was killed never leaves the daemon claimed.
+LOCKS = Path(os.environ.get("XDG_CACHE_HOME") or Path.home() / ".cache") / "jev"
+
+# Set when JEV_DAEMON_PER_RUN gave this process a daemon of its own (see __init__), which nothing
+# else will use once this process is gone, so it is stopped on the way out.
+PER_RUN = os.environ.get("JEV_DAEMON_PER_RUN") == "1"
+
+
+def claim_daemon(name=None):
+    """An exclusive hold on the daemon across processes, or None when another process has it."""
+    LOCKS.mkdir(parents=True, exist_ok=True)
+    held = open(LOCKS / f"{name or DAEMON}.lock", "a+")
+    try:
+        if sys.platform == "win32":
+            import msvcrt
+
+            held.seek(0)
+            msvcrt.locking(held.fileno(), msvcrt.LK_NBLCK, 1)
+        else:
+            import fcntl
+
+            fcntl.flock(held.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except OSError:
+        held.close()
+        return None
+    return held
+
+
+def let_go(held):
+    if sys.platform == "win32":
+        import msvcrt
+
+        try:
+            held.seek(0)
+            msvcrt.locking(held.fileno(), msvcrt.LK_UNLCK, 1)
+        except OSError:
+            pass
+    held.close()
+
+
+def stop_own_daemon():
+    """Stop the daemon this process was given. Best effort: the process is leaving either way."""
+    try:
+        restart_daemon(DAEMON)
+    except Exception:
+        pass
+
+
+def ensure_own_daemon():
+    ensure_daemon()
+    if PER_RUN:
+        atexit.unregister(stop_own_daemon)  # once, however many browsers this process opens
+        atexit.register(stop_own_daemon)
+
 
 class Browser:
     def __init__(self, url, context=None, target=None):
@@ -201,6 +261,13 @@ class Browser:
             raise DaemonBusy(
                 "This daemon already has a browser. Its events are drained as one buffer, so a "
                 "second browser would take the first one's; run one browser per daemon."
+            )
+        self.daemon_lock = claim_daemon()
+        if self.daemon_lock is None:
+            IN_USE.release()
+            raise DaemonBusy(
+                f"Another process is using the {DAEMON!r} daemon, and its events are drained as one "
+                "buffer. Give each run its own daemon with JEV_DAEMON_PER_RUN=1 or a distinct BU_NAME."
             )
         self.holds_daemon = True
         try:
@@ -223,7 +290,7 @@ class Browser:
         return cls(None, target=target)
 
     def open(self, url, context, watching):
-        ensure_daemon()
+        ensure_own_daemon()
         # Background by default so a run does not steal the window. JEV_FOREGROUND=1 brings it to
         # the front instead, for watching a run live.
         # A run gets its own browser context, so the cookies and logins of the site before it do
@@ -253,7 +320,7 @@ class Browser:
         the window it actually has. Focus emulation is still set, because a background tab stops
         drawing menus and animation frames otherwise; it belongs to this session and ends with it.
         """
-        ensure_daemon()
+        ensure_own_daemon()
         self.borrowed = True
         self.context = None
         self.target = target
@@ -271,6 +338,9 @@ class Browser:
         """Give the daemon back. Idempotent, so closing twice is not an error."""
         if getattr(self, "holds_daemon", False):
             self.holds_daemon = False
+            if getattr(self, "daemon_lock", None) is not None:
+                let_go(self.daemon_lock)
+                self.daemon_lock = None
             IN_USE.release()
 
     def watch_faults(self):

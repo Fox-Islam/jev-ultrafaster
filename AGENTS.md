@@ -44,7 +44,9 @@ host limits, page diagnostics and replay exist for that caller, not for a person
 
 - One browser per daemon. The daemon drains events as one buffer with no per-session filter, so a
   second browser takes the first one's: diagnostics would be attributed to the wrong run. A second
-  `Browser` raises `DaemonBusy`.
+  `Browser` raises `DaemonBusy`, in another process too: the claim is a file lock on
+  `~/.cache/jev/<BU_NAME>.lock`, which the OS drops when its holder dies. `JEV_DAEMON_PER_RUN=1`
+  gives each process its own daemon, stopped at exit, for runs side by side.
 - Every run gets its own browser context, disposed at close, so one customer's cookies and logins
   do not reach the next.
 - `keep_open_s` leaves the page open and puts a handle in the result. The caller keeps the
