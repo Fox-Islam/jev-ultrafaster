@@ -48,8 +48,12 @@ def test_an_attached_page_is_used_as_it_stands(sent):
         used = methods(sent)
         assert ("Target.attachToTarget", {"targetId": "T-mine", "flatten": True}) in sent
         assert "Emulation.setFocusEmulationEnabled" in used
-        for made in ("Target.createTarget", "Target.createBrowserContext",
-                     "Emulation.setDeviceMetricsOverride", "Page.navigate"):
+        for made in (
+            "Target.createTarget",
+            "Target.createBrowserContext",
+            "Emulation.setDeviceMetricsOverride",
+            "Page.navigate",
+        ):
             assert made not in used
     finally:
         browser.close()
@@ -70,8 +74,12 @@ def test_closing_an_attached_page_detaches_and_leaves_it_open(sent):
 def test_an_opened_page_is_still_made_sized_and_closed(sent):
     browser = browser_module.Browser("https://example.test/")
     used = methods(sent)
-    for made in ("Target.createBrowserContext", "Target.createTarget",
-                 "Emulation.setDeviceMetricsOverride", "Page.navigate"):
+    for made in (
+        "Target.createBrowserContext",
+        "Target.createTarget",
+        "Emulation.setDeviceMetricsOverride",
+        "Page.navigate",
+    ):
         assert made in used
     browser.close()
     assert ("Target.closeTarget", {"targetId": "T-new"}) in sent
@@ -167,10 +175,17 @@ def test_a_claim_held_elsewhere_refuses_this_process_too(sent):
 def test_a_daemon_per_run_is_named_for_this_process():
     env = {**os.environ, "JEV_DAEMON_PER_RUN": "1", "BU_NAME": "default"}
     shown = subprocess.run(
-        [sys.executable, "-c",
-         "import os, jev_ultrafast; from browser_harness import helpers; "
-         "from jev_ultrafast import browser; print(os.getpid(), helpers.NAME, browser.DAEMON, browser.PER_RUN)"],
-        capture_output=True, text=True, env=env, timeout=30, check=True,
+        [
+            sys.executable,
+            "-c",
+            "import os, jev_ultrafast; from browser_harness import helpers; "
+            "from jev_ultrafast import browser; print(os.getpid(), helpers.NAME, browser.DAEMON, browser.PER_RUN)",
+        ],
+        capture_output=True,
+        text=True,
+        env=env,
+        timeout=30,
+        check=True,
     ).stdout.split()
     pid, name, daemon, per_run = shown
     assert name == daemon and name.startswith(f"jev-{pid}-") and per_run == "True"
@@ -205,8 +220,13 @@ def run(tmp_path, how="open", end="wait"):
     env = {**os.environ, "XDG_CACHE_HOME": str(tmp_path), "BU_NAME": "jev-test-exit"}
     for name in ("JEV_DAEMON_PER_RUN", "JEV_KEEP_OPEN", "JEV_BROWSER_CONTEXT"):
         env.pop(name, None)
-    child = subprocess.Popen([sys.executable, "-c", RUN, str(log), how, end],
-                             stdin=subprocess.PIPE, stdout=subprocess.PIPE, text=True, env=env)
+    child = subprocess.Popen(
+        [sys.executable, "-c", RUN, str(log), how, end],
+        stdin=subprocess.PIPE,
+        stdout=subprocess.PIPE,
+        text=True,
+        env=env,
+    )
     assert child.stdout.readline().strip() == "open"
     return child, log
 
@@ -311,8 +331,13 @@ def test_a_per_run_lock_file_goes_when_the_run_is_terminated(tmp_path):
     env = {**os.environ, "XDG_CACHE_HOME": str(tmp_path), "BU_NAME": "jev-test-perrun"}
     env["JEV_DAEMON_PER_RUN"] = "1"
     code = RUN.replace("browser.ensure_daemon = lambda: None", "browser.ensure_own_daemon = lambda: None")
-    child = subprocess.Popen([sys.executable, "-c", code, str(tmp_path / "s.log"), "attach", "wait"],
-                             stdin=subprocess.PIPE, stdout=subprocess.PIPE, text=True, env=env)
+    child = subprocess.Popen(
+        [sys.executable, "-c", code, str(tmp_path / "s.log"), "attach", "wait"],
+        stdin=subprocess.PIPE,
+        stdout=subprocess.PIPE,
+        text=True,
+        env=env,
+    )
     assert child.stdout.readline().strip() == "open"
     assert list((tmp_path / "jev").glob("*.lock"))
     child.send_signal(signal.SIGTERM)
