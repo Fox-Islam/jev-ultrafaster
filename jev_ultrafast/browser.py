@@ -196,7 +196,7 @@ IN_USE = threading.Lock()
 
 
 class Browser:
-    def __init__(self, url, context=None):
+    def __init__(self, url, context=None, target=None):
         if not IN_USE.acquire(blocking=False):
             raise DaemonBusy(
                 "This daemon already has a browser. Its events are drained as one buffer, so a "
@@ -204,10 +204,23 @@ class Browser:
             )
         self.holds_daemon = True
         try:
-            self.open(url, context, watching=os.environ.get("JEV_FOREGROUND") == "1")
+            if target:
+                self.borrow(target)
+            else:
+                self.open(url, context, watching=os.environ.get("JEV_FOREGROUND") == "1")
         except BaseException:
             self.release()
             raise
+
+    @classmethod
+    def attach(cls, target):
+        """A browser on a page that is already open, which stays the caller's.
+
+        A caller that has already driven a tab to where a leg starts would otherwise pay for a new
+        tab and a reload of the same page, which was most of a short leg's time. The page is used
+        as it stands: its window, its size, its cookies and the address it is on.
+        """
+        return cls(None, target=target)
 
     def open(self, url, context, watching):
         ensure_daemon()
@@ -231,6 +244,28 @@ class Browser:
         if watching:
             cdp("Target.activateTarget", targetId=self.target)
         self.navigate(url)
+
+    def borrow(self, target):
+        """Attach to the caller's page without changing what it is.
+
+        No target or context is made, so there is nothing of jev's to close afterwards, and no
+        size is imposed: the page keeps the layout the caller sees, and frames are judged against
+        the window it actually has. Focus emulation is still set, because a background tab stops
+        drawing menus and animation frames otherwise; it belongs to this session and ends with it.
+        """
+        ensure_daemon()
+        self.borrowed = True
+        self.context = None
+        self.target = target
+        self.session = cdp("Target.attachToTarget", targetId=target, flatten=True)["sessionId"]
+        self.call("Emulation.setFocusEmulationEnabled", enabled=True)
+        try:
+            width, height = self.evaluate("[innerWidth, innerHeight]")
+            self.viewport = (int(width), int(height))
+        except (TypeError, ValueError, TimeoutError, StalePage):
+            pass
+        self.faults = {}
+        self.watch_faults()
 
     def release(self):
         """Give the daemon back. Idempotent, so closing twice is not an error."""
@@ -365,7 +400,8 @@ class Browser:
             # pixels and advertising slots are most of the frames on a page and none of its work,
             # and each one read costs a call whose answer can never be acted on.
             width, height = box[2] - box[0], box[7] - box[1]
-            if width < USABLE_FRAME or height < USABLE_FRAME or box[0] > VIEWPORT[0] or box[1] > VIEWPORT[1]:
+            window = getattr(self, "viewport", VIEWPORT)
+            if width < USABLE_FRAME or height < USABLE_FRAME or box[0] > window[0] or box[1] > window[1]:
                 continue
             found.append({"session": session, "offset": (box[0], box[1])})
         return found
@@ -911,6 +947,18 @@ class Browser:
             except (RuntimeError, KeyError):
                 pass
             self.screencast = None
+        if getattr(self, "borrowed", False):
+            # The page is the caller's. Detaching ends this session's emulation and leaves the tab
+            # as it was found, wherever the run took it.
+            if getattr(self, "session", None):
+                try:
+                    cdp("Target.detachFromTarget", sessionId=self.session)
+                except (RuntimeError, KeyError):
+                    pass
+                self.session = None
+            self.target = None
+            self.release()
+            return
         if os.environ.get("JEV_KEEP_OPEN") == "1":
             self.target = None  # leave the page up to be looked at
             self.release()

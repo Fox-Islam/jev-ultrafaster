@@ -31,6 +31,8 @@ def handle_for(browser, worker=None):
         "browser_session_id": browser_session_id(),
         "target_id": browser.target,
         "context_id": getattr(browser, "context", None),
+        # An attached page was the caller's before the run and stays theirs after it.
+        "borrowed": getattr(browser, "borrowed", False) is True,
     }
 
 
@@ -51,11 +53,12 @@ def close_handle(handle):
     """Close the page a handle names, and dispose the context around it.
 
     A no-op when the page is already gone, because a caller sweeping orphans cannot know which of
-    them a worker closed on its way out. Returns what it actually closed.
+    them a worker closed on its way out. A borrowed page is left open. Returns what it actually
+    closed.
     """
     closed = {"target": False, "context": False}
     target, context = handle.get("target_id"), handle.get("context_id")
-    if target:
+    if target and not handle.get("borrowed"):
         try:
             cdp("Target.closeTarget", targetId=target)
             closed["target"] = True

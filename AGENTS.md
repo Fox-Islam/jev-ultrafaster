@@ -50,6 +50,9 @@ host limits, page diagnostics and replay exist for that caller, not for a person
 - `keep_open_s` leaves the page open and puts a handle in the result. The caller keeps the
   registry; jev keeps no timer. `session.close_handle` works from another process and is a no-op
   when the page is already gone. `Agent.free` closes the page and gives the daemon back.
+- `Browser.attach(target_id)` runs in a tab that is already open. It makes no target or context,
+  sets no size and does not navigate; `close()` detaches and never closes the tab. Pass it to
+  `Agent(None, goals, browser=...)`, which keeps the page it is on.
 - `BU_CDP_WS` means a hosted endpoint, where every look is a round trip: the wait runs inside the
   page, no screencast is started, and the settle timeout is shorter. Leave local behaviour alone
   when changing either.

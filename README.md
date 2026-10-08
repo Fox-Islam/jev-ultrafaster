@@ -70,6 +70,10 @@ with Agent(
         print(state["elapsed_ms"], state["status"])
 ```
 
+To run in a tab that is already open, without a new tab or a reload, pass
+`browser=Browser.attach(target_id)` and `None` for the url. The tab is detached, not closed, when
+the browser is closed.
+
 Run with `uv run --env-file .env python your_script.py`. The same policy can run a different task:
 
 ```bash
