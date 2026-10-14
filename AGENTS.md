@@ -15,6 +15,7 @@ host limits, page diagnostics and replay exist for that caller, not for a person
 - Targets must map to observed elements and supported operations. Never let the model emit
   selectors or executable code. A caller's own JavaScript is not covered by this: `queries` runs
   what the caller wrote, which is the point of it.
+- A screenshot is marked on the captured image, never on the page.
 - TYPE_TEXT invokes the text LLM. `field_values` asks for a step's fields in one call; a value that
   does not hold up is left out and that field falls back to its own call.
 - Never retry a browser mutation. Log execution before observing its result.

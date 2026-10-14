@@ -138,8 +138,16 @@
     const where=reachable(e,r);
     if (!where) continue;
     if (rname==='gridcell' && e.querySelector('button,[role="button"]')) continue;
-    const base={node:identity(e),role:rname,label:name(e)||rname,
+    const own=name(e);
+    const base={node:identity(e),role:rname,label:own||rname,
       rect:{x:r.x,y:r.y,w:r.width,h:r.height}};
+    // Where an unnamed control sits, so a row of them - an icon toolbar, a set of swatches - can be
+    // told from one stray: a row is what text-only could not choose from. A control alone in its
+    // wrapper is grouped by the wrapper's parent, as icon buttons in list items are.
+    if (!own) {
+      const p=e.parentElement, holder=p && p.children.length===1 && p.parentElement ? p.parentElement : p;
+      if (holder) base.group=identity(holder);
+    }
     if (hoverReveals(e)) base.hover=true;
     if (where!=='view') base.offscreen=where;
     for (const key of ['checked','selected','expanded']) {

@@ -7,7 +7,7 @@ import time
 from pathlib import Path
 from urllib.parse import urlparse
 
-from . import session
+from . import screen, session
 from .browser import RESTLESS, Browser, Covered, StalePage, diagnosis, operable
 from .model import action_space, choose, field_context, field_text, field_values, readable_only, unseen
 from .questions import (
@@ -54,7 +54,11 @@ class Agent:
         self.reused = 0
         self.pending_text = None
         self.text_failures = 0
-        self.speculating = os.environ.get("JEV_SPECULATE", "1") != "0"
+        screen.require()
+        # A guess is taken from a reading made while waiting, which carries no screenshot, so with an
+        # image on every decision it would be one made without it. In auto mode guessing stays on, and
+        # `looked_at` asks a guess again with the settled page's screenshot where auto would look.
+        self.speculating = os.environ.get("JEV_SPECULATE", "1") != "0" and screen.mode() != "always"
         self.guessing, self.guessed = None, None
         self.unfresh_since = None
         self.guesses, self.guesses_used = 0, 0
@@ -71,7 +75,7 @@ class Agent:
         if self.borrowed and url:
             self.browser.navigate(url)
         self.record_dir = Path(record_dir) if record_dir else None
-        self.screenshots = screenshots or bool(record_dir)
+        self.screenshots = screenshots or bool(record_dir) or screen.enabled()
         try:
             page = self.browser.settle(screenshot=self.screenshots)
         except Exception:
@@ -175,7 +179,7 @@ class Agent:
             )
             ahead = self.take_guess(state["page"]["fingerprint"]) if self.guessing_ahead() else None
             if ahead is not None:
-                state["decision"] = ahead
+                state["decision"] = self.looked_at(ahead, state["page"], arguments)
             if ahead is None and not self.settled_or_restless(asked_about):
                 # Without `previous`, so this waits for stillness. Naming the page makes it a
                 # readiness check instead, which is quicker and fails one run in three: the wait is
@@ -232,6 +236,12 @@ class Agent:
                     state["status"] = "done"
                     # The model's own word that it finished, at a confidence a caller should weigh.
                     state["doubtful"] = (decision.get("confidence") or 0) < DOUBTFUL
+                    # A second reading from the screenshot alone, when there was one. It can only
+                    # add doubt: a page that looks finished is no stronger proof than DONE itself.
+                    seen = decision.get("screen_done")
+                    state["screen_done"] = seen
+                    if seen is not None and seen < DOUBTFUL:
+                        state["doubtful"] = True
                 else:
                     state["status"] = "blocked"
                     # A page read to the bottom without the thing on it is a different answer from
@@ -488,6 +498,22 @@ class Agent:
             self.guesses_used += 1
             return guessed[1]
         return None
+
+    def looked_at(self, guess, page, arguments):
+        """A guess, or in auto mode the decision asked again with the settled page's screenshot.
+
+        The guess was taken from a reading made while waiting, which has no screenshot, so it was
+        made without one. It is asked again wherever auto mode would have sent one.
+        """
+        if screen.mode() != "auto" or not page.get("screenshot") or (guess.get("request") or {}).get("assets"):
+            return guess
+        if not (screen.wanted(False, page["actions"], arguments[0])
+                or screen.second_look(guess["operation"], guess.get("confidence"))):
+            return guess
+        again = choose(page, *arguments, look=True)
+        again["looked_again"] = "guess"
+        again["first_look"] = {k: guess.get(k) for k in ("choice", "operation", "confidence", "usage", "latency_ms")}
+        return again
 
     def fixated(self):
         """Controls chosen more than once in the recent past without moving the page.

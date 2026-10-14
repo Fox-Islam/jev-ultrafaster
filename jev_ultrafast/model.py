@@ -7,7 +7,8 @@ import time
 
 import httpx
 
-from .questions import DROP, NEXT_ACTION, TARGET, TEXT_VALUE, TEXT_VALUES
+from . import screen
+from .questions import DROP, NEXT_ACTION, SCREEN, SCREEN_DONE, TARGET, TEXT_VALUE, TEXT_VALUES
 
 CLIENT = httpx.Client(http2=True, timeout=25)
 
@@ -49,10 +50,10 @@ def flatten_instructions(goal, rules, operation=None):
     return "\n\n".join(head + ([rules] if isinstance(rules, str) else list(rules)))
 
 
-def post_json(url, key, body):
+def post_json(url, key, body, headers=None):
     for attempt in range(3):
         try:
-            response = CLIENT.post(url, json=body, headers={"Authorization": f"Bearer {key}"})
+            response = CLIENT.post(url, json=body, headers={"Authorization": f"Bearer {key}", **(headers or {})})
         except httpx.HTTPError:
             raise RuntimeError("Model connection failed; no action executed.") from None
         if response.status_code in {429, 529, 503} and attempt < 2:
@@ -242,7 +243,7 @@ def scrolling_still_helps(state, history):
     return not down or down[-1].get("page_changed") is not False
 
 
-def choose(state, goal, history, pending=(), suppress=()):
+def choose(state, goal, history, pending=(), suppress=(), look=False):
     elements, targets, controls = action_space(state["actions"])
     zones = drop_zones(state["actions"])
     if not zones:
@@ -267,7 +268,9 @@ def choose(state, goal, history, pending=(), suppress=()):
     operations = {key: labels[key] for key in targets}
     operations.update({key: value["label"] for key, value in controls.items()})
     operations.update(DONE="Every requirement is visibly satisfied.", BLOCKED="No supported operation can progress.")
-    rules = [NEXT_ACTION]
+    image = screen.marked(state, targets) if screen.wanted(look, state["actions"], goal) else None
+    seen = [SCREEN] if image else []
+    rules = [NEXT_ACTION, *seen]
     if scrolling_still_helps(state, history):
         # Withheld rather than argued against, the way a control that stopped moving the page is:
         # an option that is not offered cannot be taken, and the next-best answer is forced.
@@ -285,7 +288,7 @@ def choose(state, goal, history, pending=(), suppress=()):
         questions[operation.lower() + "_target"] = {
             "type": "choice",
             "criteria": {index: describe_target(index, a) for index, a in candidates.items()},
-            "instructions": flatten_instructions(goal, [NEXT_ACTION, TARGET], operation),
+            "instructions": flatten_instructions(goal, [NEXT_ACTION, TARGET, *seen], operation),
         }
     if "DRAG" in targets:
         questions["drop_zone"] = {
@@ -294,6 +297,17 @@ def choose(state, goal, history, pending=(), suppress=()):
             "instructions": flatten_instructions(goal, [NEXT_ACTION, DROP], "DRAG"),
         }
     questions.update(plan_questions(pending, operations, targets, settled))
+    if image:
+        # Asked every time, read only when DONE is chosen: which decision ends the run is not
+        # known until the answers arrive, and the image is in the request either way.
+        questions["screen_done"] = {
+            "type": "noul",
+            "instructions": flatten_instructions(goal, [SCREEN, SCREEN_DONE]),
+            "criteria": {
+                "true": "The screenshot shows the goal's outcome.",
+                "false": "The screenshot shows something still to do, or does not show the outcome.",
+            },
+        }
     body = {
         "model": os.environ.get("TYPESAFE_MODEL", "jev-latest"),
         "state": {
@@ -305,8 +319,11 @@ def choose(state, goal, history, pending=(), suppress=()):
         },
         "questions": questions,
     }
+    if image:
+        screen.attach(body, image)
     started = time.perf_counter()
-    result = post_json(system_one_url(), os.environ["TYPESAFE_API_KEY"], body)
+    opt_in = {"headers": screen.HEADERS} if image else {}
+    result = post_json(system_one_url(), os.environ["TYPESAFE_API_KEY"], body, **opt_in)
     operation_answer = validate_choice(result["answers"].get("operation", {}), operations)
     operation = operation_answer["choice"]
     target = None
@@ -328,7 +345,7 @@ def choose(state, goal, history, pending=(), suppress=()):
     drop = None
     if operation == "DRAG":
         drop = zones[validate_choice(result["answers"].get("drop_zone", {}), zones)["choice"]]["id"]
-    return {
+    decided = {
         "drop": drop,
         "choice": choice,
         "operation": operation,
@@ -339,12 +356,31 @@ def choose(state, goal, history, pending=(), suppress=()):
         "target_probabilities": target_answer["probabilities"] if target_answer else {},
         "target_confidence": target_answer["confidence"] if target_answer else None,
         "plan": read_plan_answers(result["answers"], pending, operations, targets, settled),
+        "screen_done": noul(result["answers"].get("screen_done")),
         "raw_answers": result["answers"],
         "model": result["model"],
         "usage": result.get("usage", {}),
         "latency_ms": round((time.perf_counter() - started) * 1000),
-        "request": body,
+        "request": screen.recorded(body),
     }
+    # In auto mode a text-only answer that `second_look` picks out is asked again with the
+    # screenshot. The second answer stands; the first is kept so its cost is counted. Target
+    # confidence is not a reason to look: text-only gave 0.92 to a wrong swatch and 0.39-0.52 to
+    # right clicks on Wikipedia.
+    can_look = screen.mode() == "auto" and not image and not look and state.get("screenshot")
+    if can_look and screen.second_look(operation, operation_answer["confidence"]):
+        again = choose(state, goal, history, pending, suppress, look=True)
+        if again["request"] and "assets" in again["request"]:
+            again["looked_again"] = operation
+            again["first_look"] = {k: decided[k] for k in ("choice", "operation", "confidence", "usage", "latency_ms")}
+            return again
+    return decided
+
+
+def noul(answer):
+    """A Noul reading, or None when absent or malformed."""
+    value = (answer or {}).get("noul")
+    return value if type(value) in (int, float) and math.isfinite(value) and 0 <= value <= 1 else None
 
 
 def field_brief(action):

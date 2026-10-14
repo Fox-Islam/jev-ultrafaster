@@ -56,6 +56,22 @@ again. `patches/browser-harness-cdp-headers.patch` is the same change as a diff,
 
 `TEXT_MODEL_API_KEY` is an OpenRouter key in the example configuration. The current demo uses `inception/mercury-2.5` with reasoning disabled. Gemini, GLM, and DeepSeek can also use the OpenAI-compatible text helper; configure the appropriate model, endpoint, and reasoning setting.
 
+### Screenshots (experimental)
+
+`JEV_IMAGES` sends TypeSafe a screenshot of the viewport, with every offered element in view
+outlined and tagged with its index. It needs `uv sync --extra images`. Images are a TypeSafe preview
+feature, sent with `TypeSafe-Danger-Zone-Images: true`, and a 1120×780 screenshot costs about 2.5k
+input tokens per decision.
+
+- `JEV_IMAGES=1` sends one with every decision. Speculative decisions are off, since the readings
+  they are taken from carry no screenshot.
+- `JEV_IMAGES=auto` sends one where text-only was measured to fail: up front when two or more
+  unnamed controls sit together in view, or when the goal names a colour, a highlight, an icon or
+  a position such as "right of"; and as a second request when the text-only answer is BLOCKED, a
+  DONE below 0.9 confidence, or any other operation below 0.6. Speculative decisions stay on.
+- A request with a screenshot also asks whether the screenshot alone shows the goal done. A DONE it
+  does not bear out is reported `doubtful`, with the reading in `screen_done`.
+
 ## Use the library
 
 ```python
