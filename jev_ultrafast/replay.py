@@ -13,7 +13,7 @@ import json
 import time
 
 from .browser import Browser, StalePage
-from .model import submits
+from .model import secret_for, submits
 
 VERSION = 1
 
@@ -48,6 +48,8 @@ def script(state, name=None):
         recorded = {"kind": step["kind"], "label": step["action"]}
         if step.get("text") is not None:
             recorded["text"] = step["text"]
+        if step.get("secret"):
+            recorded["secret"] = True  # typed from the caller's secrets again; never written down
         if step.get("drop"):
             # Where it was dropped, named like the thing dragged, so both are found again by name.
             recorded["drop"] = step["drop"]
@@ -102,19 +104,23 @@ def control(page, step, number):
     )
 
 
-def replay(document, browser=None, screenshots=False, on_step=None):
+def replay(document, browser=None, screenshots=False, on_step=None, secrets=None):
     """Run a script back. Returns one record per step, in order.
 
     A browser may be supplied to replay into a page already open; otherwise one is opened at the
-    script's url and closed afterwards.
+    script's url and closed afterwards. A step that typed a secret types the one `secrets` names
+    for its field, as the run did.
     """
+    for step in document.get("steps") or []:
+        if step.get("secret") and secret_for(step["label"], secrets) is None:
+            raise ValueError(f"Step {step['label']!r} types a secret; pass it as secrets.")
     if document.get("version") != VERSION:
         raise ValueError(f"Script version {document.get('version')!r} is not {VERSION}")
     borrowed, repeatable = browser is not None, not mutates(document)
     for attempt in range(RECONNECTS + 1):
         done = []
         try:
-            run_once(document, browser, screenshots, on_step, done)
+            run_once(document, browser, screenshots, on_step, done, secrets)
             return {"status": "done", "completed": len(done), "steps": done}
         except (RuntimeError, OSError) as dropped:
             # A borrowed browser belongs to the caller, so a lost connection is theirs to handle.
@@ -139,7 +145,7 @@ def dropped_connection(error):
     return any(sign in text for sign in ("websocket", "connection closed", "not attached", "disconnected"))
 
 
-def run_once(document, browser, screenshots, on_step, done):
+def run_once(document, browser, screenshots, on_step, done, secrets=None):
     borrowed = browser is not None
     browser = browser or Browser(document["url"])
     started = time.perf_counter()
@@ -152,7 +158,8 @@ def run_once(document, browser, screenshots, on_step, done):
                     # Passed only for a drag, so a browser written before drags still replays the rest.
                     extra = {"drop": control(page, {"label": step["drop"], "kind": "drop"}, number)} \
                         if step.get("drop") else {}
-                    browser.act(action, page, text=step.get("text"), **extra)
+                    text = secret_for(step["label"], secrets) if step.get("secret") else step.get("text")
+                    browser.act(action, page, text=text, **extra)
                     break
                 except StalePage:
                     # The page moved between being read and being acted on. Read it again; the

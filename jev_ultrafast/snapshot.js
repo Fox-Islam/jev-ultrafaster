@@ -22,6 +22,9 @@
     return null;
   };
   const safe = e => !['password','file','hidden'].includes(e.type);
+  // A password field is offered so a caller's secret can be typed into it, but its value is never
+  // read: what it holds is reported only as whether it holds anything.
+  const secret = e => e.tagName==='INPUT' && e.type==='password';
   const shown = e => !across(e,'[aria-hidden="true"],[inert]') && e.checkVisibility({checkVisibilityCSS:true});
   const visible = e => shown(e) && e.checkVisibility({checkOpacity:true,checkVisibilityCSS:true});
   // Shown but transparent: the usual way a row reveals its delete or edit control under the
@@ -80,7 +83,7 @@
       if (['button','submit','reset','image'].includes(e.type)) return 'button';
       if (e.type==='search') return 'searchbox';
       if (e.type==='number') return 'spinbutton';
-      if (['text','email','url','tel'].includes(e.type)) return 'textbox';
+      if (['text','email','url','tel','password'].includes(e.type)) return 'textbox';
     }
     return null;
   };
@@ -125,7 +128,7 @@
   cache.guard=e=>{
     if (!e?.isConnected || !shown(e)) return null;
     const scope=across(e,'form,dialog,[role="dialog"],article,li,tr,[role="row"]') || e.parentElement;
-    return [identity(e),role(e),name(e),e.value??null,e.checked??null,e.selectedIndex??null,
+    return [identity(e),role(e),name(e),secret(e) ? !!e.value : e.value??null,e.checked??null,e.selectedIndex??null,
       e.readOnly??null,e.matches(':disabled'),e.getAttribute('aria-disabled'),
       e.getAttribute('aria-expanded'),e.getAttribute('aria-checked'),e.getAttribute('aria-selected'),
       e.getAttribute('href'),scope?.innerText?.slice(0,6000)||''];
@@ -145,7 +148,7 @@
   };
   const actions=[], later=[];
   for (const e of deep(selector)) {
-    if (!safe(e) || !shown(e) || e.matches(':disabled') || across(e,'[aria-disabled="true"]')) continue;
+    if (!(safe(e) || secret(e)) || !shown(e) || e.matches(':disabled') || across(e,'[aria-disabled="true"]')) continue;
     const r=e.getBoundingClientRect(), rname=role(e);
     if (!rname || r.width<=0 || r.height<=0) continue;
     const where=reachable(e,r);
@@ -180,10 +183,11 @@
       const editable=!e.readOnly && e.getAttribute('aria-readonly')!=='true' &&
         (['textbox','searchbox','spinbutton'].includes(rname) ||
           (rname==='combobox' && ['INPUT','TEXTAREA'].includes(e.tagName)));
-      const value='value' in e ? String(e.value) :
+      const value=secret(e) ? (e.value ? '(filled)' : '') : 'value' in e ? String(e.value) :
         e.isContentEditable || rname==='combobox' ? e.innerText.trim() : '';
-      into.push({...base,kind:editable?'fill':'click',value});
-      if (editable) into.push({...base,kind:'click',value,label:'Open '+base.label});
+      const hidden=secret(e) ? {secret:true} : {};
+      into.push({...base,...hidden,kind:editable?'fill':'click',value});
+      if (editable) into.push({...base,...hidden,kind:'click',value,label:'Open '+base.label});
     }
   }
   // Things that can be dragged, and places they can be dropped. Sources announce themselves:

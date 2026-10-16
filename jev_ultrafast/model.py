@@ -33,6 +33,8 @@ def describe_target(index, action):
             parts.append(f"{flag}: {action[flag]}")
     # Said, because the model cannot see either: a control that appears under the pointer, and
     # one that is used by being brought into view, are both as usable as anything on screen.
+    if action.get("secret"):
+        parts.append("a password field, typed from the caller's secret")
     if action.get("colour") and os.environ.get("JEV_COLOURS", "1") != "0":
         parts.append(f"filled {action['colour']}")
     if action.get("hover"):
@@ -111,6 +113,40 @@ def readable_only(actions):
         if action["kind"] not in {"fill", "select", "drag", "drop"}
         and not (action["kind"] == "click" and submits(action))
     ]
+
+
+def without_secrets(actions):
+    """The actions a run with no secrets may take: a password field is offered only to a run that
+    has something of the caller's to type into it."""
+    return [action for action in actions if not action.get("secret")]
+
+
+def secret_for(label, secrets):
+    """The caller's secret for the field labelled `label`: the one whose name the label contains,
+    or the only one there is."""
+    if not secrets:
+        return None
+    named = [value for name, value in secrets.items() if name.lower() in (label or "").lower()]
+    return named[0] if named else next(iter(secrets.values())) if len(secrets) == 1 else None
+
+
+def scrubbed(page, secrets):
+    """The page with every secret's value replaced, so a field a page shows in clear - after a
+    "Show password" toggle, say - never sends the secret to a model."""
+    values = [v for v in (secrets or {}).values() if v]
+    if not values:
+        return page
+
+    def scrub(text):
+        for value in values:
+            text = text.replace(value, "<secret>")
+        return text
+
+    actions = [
+        {k: scrub(v) if isinstance(v, str) else v for k, v in action.items()}
+        for action in page["actions"]
+    ]
+    return dict(page, text=scrub(page.get("text") or ""), title=scrub(page.get("title") or ""), actions=actions)
 
 
 def drop_zones(actions):

@@ -97,6 +97,11 @@ with Agent(
         print(state["elapsed_ms"], state["status"])
 ```
 
+`Agent(..., secrets={"password": ...})` lets a run fill password fields, which are otherwise not
+offered. The executor types the secret whose name the field's label contains, or the only one
+given; it is never sent to a model, and a step records that a secret was typed, not which.
+`replay(script, secrets=...)` types it again.
+
 To run in a tab that is already open, without a new tab or a reload, pass
 `browser=Browser.attach(target_id)` and `None` for the url. The tab is detached, not closed, when
 the browser is closed.

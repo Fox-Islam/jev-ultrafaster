@@ -1008,7 +1008,7 @@ def test_a_reading_script_is_taken_again_after_the_connection_goes(monkeypatch):
     assert replay_module.mutates(document) is False
     attempts = []
 
-    def run_once(doc, browser, screenshots, on_step, done):
+    def run_once(doc, browser, screenshots, on_step, done, secrets=None):
         attempts.append(1)
         if len(attempts) == 1:
             raise RuntimeError("WebSocket connection closed")
@@ -1025,7 +1025,7 @@ def test_a_script_that_types_is_not_taken_again_and_says_where_it_stopped(monkey
     assert replay_module.mutates(document) is True
     attempts = []
 
-    def run_once(doc, browser, screenshots, on_step, done):
+    def run_once(doc, browser, screenshots, on_step, done, secrets=None):
         attempts.append(1)
         done.append({"step": 1})  # the first step went through before the connection went
         raise RuntimeError("WebSocket connection closed")

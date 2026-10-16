@@ -9,7 +9,18 @@ from urllib.parse import urlparse
 
 from . import screen, session
 from .browser import RESTLESS, Browser, Covered, StalePage, diagnosis, operable
-from .model import action_space, choose, field_context, field_text, field_values, readable_only, unseen
+from .model import (
+    action_space,
+    choose,
+    field_context,
+    field_text,
+    field_values,
+    readable_only,
+    scrubbed,
+    secret_for,
+    unseen,
+    without_secrets,
+)
 from .questions import (
     DOUBTFUL,
     EVIDENCE_TEXT,
@@ -26,7 +37,7 @@ from .questions import (
 class Agent:
     def __init__(self, url, goals, *, browser=None, record_dir=None, screenshots=False, track_plan=False,
                  reuse_held=True, read_only=False, allowed_hosts=None, max_steps=MAX_STEPS,
-                 queries=(), keep_open_s=0):
+                 queries=(), keep_open_s=0, secrets=None):
         steps = [goals] if isinstance(goals, str) else list(goals)
         # A goal list may carry questions for the page as well as things to do. A question is
         # asked once everything named before it is satisfied, so a caller can read the page part
@@ -63,6 +74,8 @@ class Agent:
         self.unfresh_since = None
         self.guesses, self.guesses_used = 0, 0
         self.read_only = read_only
+        # Typed into password fields by the executor, never sent to a model or written to a step.
+        self.secrets = dict(secrets or {})
         # Matched on suffix, so naming a site covers its subdomains without listing them.
         self.allowed_hosts = tuple(host.lower().lstrip(".") for host in (allowed_hosts or ()))
         self.max_steps = max_steps
@@ -190,7 +203,7 @@ class Agent:
                 # what keeps a decision from being taken on a moving page and then rejected.
                 state["page"] = state["browser"].settle(screenshot=self.screenshots)
             if state["decision"] is None:
-                state["decision"] = choose(state["page"], *arguments)
+                state["decision"] = self.choose(state["page"], *arguments)
             for index, entry in zip(outstanding, state["decision"].get("plan") or []):
                 satisfied = entry["satisfied"]
                 if satisfied is not None and satisfied >= PLAN_SATISFIED:
@@ -266,7 +279,11 @@ class Agent:
                 drop = next((a for a in page["actions"] if a["id"] == decision.get("drop")), None)
                 if drop is None:
                     raise StalePage("The drag's drop zone is not on this page. Choose again.")
-            if action["kind"] == "fill":
+            if action["kind"] == "fill" and action.get("secret"):
+                text = secret_for(action["label"], getattr(self, "secrets", None))
+                if text is None:
+                    raise ValueError(f"No secret for {action['label']!r}; pass one as secrets.")
+            elif action["kind"] == "fill":
                 if not self.settled_or_restless(page):
                     raise StalePage("Page changed before text generation. Choose again.")
                 # A held decision was taken for one sub-goal, so that is what the field is for.
@@ -312,7 +329,8 @@ class Agent:
                     "probability": decision["probabilities"][selected],
                     "confidence": decision["confidence"],
                     "latency_ms": decision["latency_ms"],
-                    "text": text,
+                    "text": None if action.get("secret") else text,
+                    "secret": bool(action.get("secret")),
                     "text_helper": helper["model"] if helper else None,
                     "text_latency_ms": helper["latency_ms"] if helper else 0,
                     "operation": decision["operation"],
@@ -376,7 +394,7 @@ class Agent:
         stands, with the sub-goals never confirmed recorded for the caller.
         """
         state = self.state
-        checked = choose(page, state["plan"][self.unsatisfied()[0]], state["history"], [], self.fixated())
+        checked = self.choose(page, state["plan"][self.unsatisfied()[0]], state["history"], [], self.fixated())
         state["decisions"].append(
             {
                 **checked,
@@ -475,7 +493,7 @@ class Agent:
         """
         def ask(page, arguments):
             try:
-                self.guessed = (page["fingerprint"], choose(page, *arguments))
+                self.guessed = (page["fingerprint"], self.choose(page, *arguments))
             except Exception:  # noqa: BLE001
                 self.guessed = None
 
@@ -503,6 +521,13 @@ class Agent:
             return guessed[1]
         return None
 
+    def choose(self, page, *arguments, **options):
+        """A decision about `page`, which offers password fields only to a run with secrets and
+        never shows a model a secret's value."""
+        secrets = getattr(self, "secrets", None)
+        shown = scrubbed(page, secrets) if secrets else dict(page, actions=without_secrets(page["actions"]))
+        return choose(shown, *arguments, **options)
+
     def looked_at(self, guess, page, arguments):
         """A guess, or in auto mode the decision asked again with the settled page's screenshot.
 
@@ -514,7 +539,7 @@ class Agent:
         if not (screen.wanted(False, page["actions"], arguments[0])
                 or screen.second_look(guess["operation"], guess.get("confidence"))):
             return guess
-        again = choose(page, *arguments, look=True)
+        again = self.choose(page, *arguments, look=True)
         again["looked_again"] = "guess"
         again["first_look"] = {k: guess.get(k) for k in ("choice", "operation", "confidence", "usage", "latency_ms")}
         return again
@@ -559,12 +584,14 @@ class Agent:
             acting = next((a for a in page["actions"] if a["id"] == decision.get("choice")), None)
             # Whatever it already holds: the decision is to type here, and a field arriving with
             # something in it - a city guessed from the connection, say - is one to replace.
-            if acting is not None and acting["kind"] == "fill" and acting["label"] not in self.ready_values:
+            if (acting is not None and acting["kind"] == "fill" and not acting.get("secret")
+                    and acting["label"] not in self.ready_values):
                 wanted[acting["label"]] = (state["goal"], acting)
         for index, entry in self.held.items():
             if entry.get("operation") != "TYPE_TEXT" or not entry.get("label"):
                 continue
-            matches = [a for a in page["actions"] if a["label"] == entry["label"] and a["kind"] == "fill"]
+            matches = [a for a in page["actions"]
+                       if a["label"] == entry["label"] and a["kind"] == "fill" and not a.get("secret")]
             if len(matches) != 1 or matches[0].get("value") or matches[0]["label"] in wanted:
                 continue
             if matches[0]["label"] in self.ready_values:
@@ -577,7 +604,7 @@ class Agent:
         if decision.get("operation") == "TYPE_TEXT":
             labels = [a["label"] for a in page["actions"] if a["kind"] == "fill"]
             for action in page["actions"]:
-                if action["kind"] != "fill" or action.get("value") or action["label"] in wanted:
+                if action["kind"] != "fill" or action.get("secret") or action.get("value") or action["label"] in wanted:
                     continue
                 if action["label"] in self.ready_values:
                     continue
