@@ -72,6 +72,17 @@ input tokens per decision.
 - A request with a screenshot also asks whether the screenshot alone shows the goal done. A DONE it
   does not bear out is reported `doubtful`, with the reading in `screen_done`.
 
+### What follows an action
+
+A decision is told what the last input caused: the site's own fetches that wrote something or
+failed, with method, address and status, and the page's console errors and uncaught exceptions.
+A save the page reports as done while its request failed, or while it logged an error, is then
+not taken for success. Fetches to other sites, such as analytics and adverts, are left out.
+`JEV_SIGNALS=0` turns this off.
+
+An unnamed control is described by the colour it is filled with, so a set of swatches can be
+told apart. `JEV_COLOURS=0` turns this off.
+
 ## Use the library
 
 ```python

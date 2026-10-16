@@ -130,6 +130,19 @@
       e.getAttribute('aria-expanded'),e.getAttribute('aria-checked'),e.getAttribute('aria-selected'),
       e.getAttribute('href'),scope?.innerText?.slice(0,6000)||''];
   };
+  // The colour an unnamed control is filled with, by name, so a set of swatches has something to be
+  // told apart by. Nothing for a control with no fill of its own.
+  const colourOf = css => {
+    const m=css.match(/rgba?\(([\d.]+),\s*([\d.]+),\s*([\d.]+)(?:,\s*([\d.]+))?/);
+    if (!m || (m[4]!==undefined && +m[4]<0.5)) return null;
+    const [r,g,b]=[+m[1]/255,+m[2]/255,+m[3]/255], max=Math.max(r,g,b), min=Math.min(r,g,b), l=(max+min)/2, d=max-min;
+    if (d<0.12) return l<0.2 ? 'black' : l>0.85 ? 'white' : 'grey';
+    let h=max===r ? ((g-b)/d)%6 : max===g ? (b-r)/d+2 : (r-g)/d+4;
+    h=(h*60+360)%360;
+    if (l<0.35 && (h<45 || h>=330)) return 'brown';
+    return h<15 || h>=345 ? 'red' : h<45 ? 'orange' : h<70 ? 'yellow' : h<165 ? 'green' : h<200 ? 'cyan' :
+      h<255 ? 'blue' : h<290 ? 'purple' : 'pink';
+  };
   const actions=[], later=[];
   for (const e of deep(selector)) {
     if (!safe(e) || !shown(e) || e.matches(':disabled') || across(e,'[aria-disabled="true"]')) continue;
@@ -147,6 +160,8 @@
     if (!own) {
       const p=e.parentElement, holder=p && p.children.length===1 && p.parentElement ? p.parentElement : p;
       if (holder) base.group=identity(holder);
+      const fill=colourOf(getComputedStyle(e).backgroundColor);
+      if (fill) base.colour=fill;
     }
     if (hoverReveals(e)) base.hover=true;
     if (where!=='view') base.offscreen=where;

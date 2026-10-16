@@ -33,6 +33,8 @@ def describe_target(index, action):
             parts.append(f"{flag}: {action[flag]}")
     # Said, because the model cannot see either: a control that appears under the pointer, and
     # one that is used by being brought into view, are both as usable as anything on screen.
+    if action.get("colour") and os.environ.get("JEV_COLOURS", "1") != "0":
+        parts.append(f"filled {action['colour']}")
     if action.get("hover"):
         parts.append("shown when hovered")
     if action.get("offscreen") == "panel":
@@ -316,6 +318,7 @@ def choose(state, goal, history, pending=(), suppress=(), look=False):
             "recent_actions": [
                 {k: h.get(k) for k in ("action", "kind", "text", "page_changed")} for h in history[-10:]
             ],
+            **(state.get("after_action") or {}),
         },
         "questions": questions,
     }

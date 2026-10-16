@@ -178,6 +178,10 @@ class Agent:
                 self.fixated(),
             )
             ahead = self.take_guess(state["page"]["fingerprint"]) if self.guessing_ahead() else None
+            if ahead is not None and state["page"].get("after_action"):
+                # Taken from a reading made while waiting, which is not told what followed the
+                # last action; the settled page is, and what it was told can change the answer.
+                ahead = None
             if ahead is not None:
                 state["decision"] = self.looked_at(ahead, state["page"], arguments)
             if ahead is None and not self.settled_or_restless(asked_about):

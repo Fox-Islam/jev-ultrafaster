@@ -9,6 +9,7 @@ import sys
 import threading
 import time
 from pathlib import Path
+from urllib.parse import urlparse
 
 from browser_harness.admin import ensure_daemon, restart_daemon
 from browser_harness.helpers import NAME as DAEMON
@@ -54,6 +55,12 @@ SETTLE_BUSY = float(os.environ.get("JEV_SETTLE_BUSY", "1.5" if REMOTE else "8"))
 # The kinds of request a page draws from. Documents, scripts and images are covered by the load
 # event and by paint; beacons and pings draw nothing.
 FETCHES = {"XHR", "Fetch"}
+# How much of what followed an action a decision is told about, and how much of a failed request's
+# response it sees.
+AFTER_ACTION_KEPT = 5
+FAILED_BODY = 300
+# Whether a decision is told what followed the last action. JEV_SIGNALS=0 turns it off.
+SIGNALS = os.environ.get("JEV_SIGNALS", "1") != "0"
 # A fetch open longer than this is a stream or a long poll, not content on its way.
 LONG_REQUEST = float(os.environ.get("JEV_LONG_REQUEST", "10"))
 # How often a page with nothing operable of its own is checked for controls inside its frames.
@@ -436,10 +443,16 @@ class Browser:
                 faults.setdefault("console", []).append({
                     "level": entry["level"], "text": (entry.get("text") or "")[:200], "url": entry.get("url"),
                 })
+        elif method == "Runtime.consoleAPICalled" and params.get("type") == "error":
+            # A page's own console.error arrives here; Log.entryAdded carries only the browser's.
+            text = " ".join(str(a.get("value", a.get("description", ""))) for a in params.get("args") or [])
+            faults.setdefault("console", []).append({"level": "error", "text": text[:200], "url": None})
+            self.since_action()["console"].append(text[:200])
         elif method == "Runtime.exceptionThrown":
             details = params.get("exceptionDetails") or {}
             thrown = (details.get("exception") or {}).get("description") or details.get("text") or ""
             faults.setdefault("exceptions", []).append({"text": thrown[:200], "url": details.get("url")})
+            self.since_action()["console"].append(thrown[:200])
         elif method == "Network.responseReceived":
             response = params.get("response") or {}
             if params.get("type") == "Document" and response.get("url"):
@@ -451,6 +464,12 @@ class Browser:
             if params.get("type") == "Document" and response.get("url"):
                 # The first document response is the page's own status; later ones are its frames.
                 faults.setdefault("document_status", response["status"])
+            if params.get("type") in FETCHES:
+                sent = self.since_action()["sent"].get(params.get("requestId"), {})
+                self.since_action()["requests"].append({
+                    "id": params.get("requestId"), "method": sent.get("method"),
+                    "url": (response.get("url") or "")[:200], "status": response.get("status"),
+                })
         elif method == "Network.loadingFailed":
             self.requests_open().pop(params.get("requestId"), None)
             faults.setdefault("requests", []).append({
@@ -458,8 +477,46 @@ class Browser:
             })
         if method == "Network.requestWillBeSent" and params.get("type") in FETCHES:
             self.requests_open()[params.get("requestId")] = time.monotonic()
+            sent = self.since_action()["sent"]
+            sent[params.get("requestId")] = {"method": (params.get("request") or {}).get("method")}
         elif method == "Network.loadingFinished":
             self.requests_open().pop(params.get("requestId"), None)
+
+    def since_action(self, reset=False):
+        """The page's fetches and console errors since the last action, as events report them."""
+        if reset or getattr(self, "since", None) is None:
+            self.since = {"sent": {}, "requests": [], "console": []}
+        return self.since
+
+    def after_action(self, page):
+        """What followed the last action, for a decision to weigh: the site's own fetches that
+        wrote something or failed, with a failed one's response, and the console errors.
+
+        A fetch to another site is left out: analytics and adverts make them on every page, and a
+        decision told about them reads a page that works as one that failed.
+        """
+        host = (urlparse(page.get("url") or "").hostname or "").split(".")[-2:]
+        requests = []
+        for request in self.since_action()["requests"]:
+            other = (urlparse(request["url"]).hostname or "").split(".")[-2:] != host
+            wrote = request["method"] not in {None, "GET", "HEAD", "OPTIONS"}
+            failed = (request["status"] or 0) >= 400
+            if other or not (wrote or failed):
+                continue
+            entry = {k: request[k] for k in ("method", "url", "status")}
+            if failed:
+                try:
+                    body = self.call("Network.getResponseBody", requestId=request["id"]).get("body") or ""
+                    entry["response"] = body[:FAILED_BODY]
+                except (RuntimeError, KeyError):
+                    pass  # the status says it failed; the body is what it said, when Chrome kept it
+            requests.append(entry)
+        out = {}
+        if requests:
+            out["network_after_last_action"] = requests[-AFTER_ACTION_KEPT:]
+        if self.since_action()["console"]:
+            out["console_errors_after_last_action"] = self.since_action()["console"][-AFTER_ACTION_KEPT:]
+        return out
 
     def requests_open(self):
         """Fetches the page has started and not finished, by request id, with when each began."""
@@ -709,6 +766,9 @@ class Browser:
         page = self.hold_still(screenshot, timeout, previous, stabilise, glimpse)
         if stabilise or previous is None or unsettling(previous, page):
             page = self.arrive(page, screenshot, started)
+        if SIGNALS:
+            self.collect()
+            page["after_action"] = self.after_action(page)
         return page
 
     def arrive(self, page, screenshot, started):
@@ -1000,6 +1060,11 @@ class Browser:
     def act(self, action, page, text=None, insist=False, drop=None):
         if not insist and not self.fresh(page, action):
             raise StalePage("Page changed since this decision. Observe again.")
+        if action["kind"] not in {"wait", "scroll"}:
+            # What came before this input followed the last one. Waiting and scrolling send nothing
+            # to the site, so what the last input caused is still what a decision needs to know.
+            self.collect()
+            self.since_action(reset=True)
         if action["kind"] == "wait":
             time.sleep(0.1)
         result = browser_operation({
